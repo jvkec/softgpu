@@ -30,7 +30,10 @@ typedef struct sgStats {
     uint64_t device_busy_cycles;
     uint64_t device_idle_cycles;
     uint64_t device_cmds_executed;
+    uint64_t device_batches;   /* times the device woke up and found work   */
     uint64_t driver_submits;
+    uint64_t driver_waits;     /* times the host blocked waiting on the device */
+    uint64_t driver_stalls;    /* times submission blocked on a full queue     */
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
 } sgStats_t;

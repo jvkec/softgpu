@@ -125,6 +125,41 @@ static void test_alloc_reuse_and_oom() {
     CHECK_OK(sgFree(p[3]));
 }
 
+static void test_async_ordering() {
+    // Thousands of async fills — far more than any ring depth — then one
+    // sync. The device must apply them in order and the last one must win.
+    const size_t n = 4096;
+    sgDevPtr d = 0;
+    CHECK_OK(sgMalloc(&d, n));
+    for (int i = 0; i < 20000; ++i) CHECK_OK(sgMemset(d, i & 0xff, n));
+    CHECK_OK(sgDeviceSynchronize());
+    std::vector<uint8_t> out(n);
+    CHECK_OK(sgMemcpyD2H(out.data(), d, n));
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == (19999 & 0xff); }));
+
+    // Data dependency through the queue without an explicit sync in between.
+    sgDevPtr a = 0, b = 0, c = 0;
+    const uint32_t m = 1 << 14;
+    CHECK_OK(sgMalloc(&a, m * 4)); CHECK_OK(sgMalloc(&b, m * 4)); CHECK_OK(sgMalloc(&c, m * 4));
+    std::vector<float> ha(m, 3.0f), hb(m, 4.0f), hc(m);
+    CHECK_OK(sgMemcpyH2D(a, ha.data(), m * 4));
+    CHECK_OK(sgMemcpyH2D(b, hb.data(), m * 4));
+    CHECK_OK(sgVaddF32(c, a, b, m));
+    CHECK_OK(sgMemcpyD2D(a, c, m * 4));   // reuse a as scratch: a = c
+    CHECK_OK(sgVaddF32(c, a, b, m));      // c = (3+4)+4
+    CHECK_OK(sgMemcpyD2H(hc.data(), c, m * 4));
+    CHECK(std::all_of(hc.begin(), hc.end(), [](float v) { return v == 11.0f; }));
+
+    // Sync with nothing outstanding is a no-op that does not block.
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(s1.driver_waits == s0.driver_waits);
+
+    CHECK_OK(sgFree(d)); CHECK_OK(sgFree(a)); CHECK_OK(sgFree(b)); CHECK_OK(sgFree(c));
+}
+
 static void test_concurrent_submitters() {
     // Many threads hammering the driver; every thread verifies its own data.
     const int T = 8, iters = 200;
@@ -160,6 +195,7 @@ int main() {
         {"gemm", test_gemm},
         {"validation", test_validation},
         {"alloc_reuse_and_oom", test_alloc_reuse_and_oom},
+        {"async_ordering", test_async_ordering},
         {"concurrent_submitters", test_concurrent_submitters},
     };
     for (auto& t : tests) {

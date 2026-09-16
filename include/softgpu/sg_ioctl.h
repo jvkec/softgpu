@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   1u
+#define SG_ABI_VERSION   2u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_STAGING_SIZE  (4ull << 20)   /* BASELINE: one 4 MiB host bounce buffer */
 #define SG_ALLOC_ALIGN   256u           /* VRAM allocation granularity            */
@@ -71,14 +71,23 @@ struct sg_free_args {
 
 struct sg_submit_args {
     struct sg_cmd cmd;
-    uint64_t host_ptr; /* user buffer for COPY_H2D/COPY_D2H, 0 otherwise */
+    uint64_t host_ptr; /* in:  user buffer for COPY_H2D/COPY_D2H, 0 otherwise  */
+    uint64_t fence;    /* out: fence value that retires when this command does */
+};
+
+/* Block until the device has retired every command up to `fence`. */
+struct sg_wait_args {
+    uint64_t fence;
 };
 
 struct sg_stats_args {
-    uint64_t busy_cycles;   /* device: cycles spent executing commands  */
-    uint64_t idle_cycles;   /* device: cycles spent waiting for work    */
-    uint64_t cmds_executed; /* device: commands retired                 */
-    uint64_t submits;       /* driver: SG_IOC_SUBMIT calls              */
+    uint64_t busy_cycles;   /* device: cycles spent executing commands          */
+    uint64_t idle_cycles;   /* device: cycles spent waiting for work            */
+    uint64_t cmds_executed; /* device: commands retired                         */
+    uint64_t batches;       /* device: idle->busy transitions (doorbell wakes)  */
+    uint64_t submits;       /* driver: SG_IOC_SUBMIT calls                      */
+    uint64_t waits;         /* driver: times the host blocked on a fence        */
+    uint64_t stalls;        /* driver: times submission blocked on a full ring  */
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
 };
@@ -93,7 +102,8 @@ enum sg_ioc {
     SG_IOC_FREE        = 0x5303, /* sg_free_args   */
     SG_IOC_SUBMIT      = 0x5304, /* sg_submit_args */
     SG_IOC_STATS       = 0x5305, /* sg_stats_args  */
-    SG_IOC_RESET_STATS = 0x5306  /* no argument    */
+    SG_IOC_RESET_STATS = 0x5306, /* no argument    */
+    SG_IOC_WAIT        = 0x5307  /* sg_wait_args   */
 };
 
 #ifdef __cplusplus

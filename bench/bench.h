@@ -85,6 +85,7 @@ struct Window {
     Clock::time_point t0, t1;
 
     void begin() {
+        sgDeviceSynchronize(); // warm-up work must not leak into the window
         sgResetStats();
         sgGetStats(&s0);
         cpu0 = thread_cpu_ns();
@@ -100,6 +101,9 @@ struct Window {
     double dev_busy() const { return double(s1.device_busy_cycles - s0.device_busy_cycles); }
     double dev_idle() const { return double(s1.device_idle_cycles - s0.device_idle_cycles); }
     double dev_cmds() const { return double(s1.device_cmds_executed - s0.device_cmds_executed); }
+    double dev_batches() const { return double(s1.device_batches - s0.device_batches); }
+    double waits() const { return double(s1.driver_waits - s0.driver_waits); }
+    double stalls() const { return double(s1.driver_stalls - s0.driver_stalls); }
 
     // Fill the standard metrics every benchmark reports.
     void fill(Row& r, double ops) const {
@@ -107,6 +111,9 @@ struct Window {
         r.metrics["cpu_ns_per_op"] = cpu_ns() / ops;
         r.metrics["dev_util"] = dev_busy() / std::max(1.0, dev_busy() + dev_idle());
         r.metrics["dev_cmds_per_op"] = dev_cmds() / ops;
+        r.metrics["waits_per_op"] = waits() / ops;
+        r.metrics["stalls_per_op"] = stalls() / ops;
+        r.metrics["avg_batch"] = dev_cmds() / std::max(1.0, dev_batches());
     }
 };
 
@@ -115,11 +122,13 @@ struct Options {
     std::string json;
     std::string tag = "baseline";
     int threads_max = 8;
+    int repeat = 1; // run the whole selection N times, report per-metric medians
 };
 
 void die_on(sgError_t e, const char* what);
 
 void bench_submit(const Options&, Report&);
+void bench_batch(const Options&, Report&);
 void bench_memcpy(const Options&, Report&);
 void bench_vadd(const Options&, Report&);
 void bench_gemm(const Options&, Report&);

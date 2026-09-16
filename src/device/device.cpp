@@ -2,6 +2,10 @@
 
 #include <cerrno>
 #include <cstring>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #include "common/clock.h"
 #include "common/cpu.h"
@@ -17,9 +21,19 @@ Device::Device(uint64_t vram_bytes)
 
 Device::~Device() { power_off(); }
 
-void Device::power_on() {
+void Device::power_on(int cpu) {
     if (running_.exchange(true)) return;
     engine_ = std::thread(&Device::run, this);
+#ifdef __linux__
+    if (cpu >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        pthread_setaffinity_np(engine_.native_handle(), sizeof set, &set);
+    }
+#else
+    (void)cpu;
+#endif
 }
 
 void Device::power_off() {
@@ -31,44 +45,64 @@ void Device::reset_stats() {
     regs_.busy_cycles.store(0, std::memory_order_relaxed);
     regs_.idle_cycles.store(0, std::memory_order_relaxed);
     regs_.cmds_executed.store(0, std::memory_order_relaxed);
+    regs_.batches.store(0, std::memory_order_relaxed);
+    regs_.stats_gen.fetch_add(1, std::memory_order_release);
 }
 
 bool Device::vram_range_ok(uint64_t off, uint64_t len) const {
     return off <= vram_size_ && len <= vram_size_ - off;
 }
 
-// The engine loop. BASELINE: the engine is always on and always spinning on
-// the doorbell — there is no idle state, no clock gating, nothing. Idle
-// cycles are therefore 100% "wasted power", which is the point of measuring
-// them from day one.
+// The engine loop. Still always-on and spinning when idle (stage 7 is where
+// that changes), but now it drains every command the driver has published
+// before going back to idle, so one doorbell can retire many commands.
 void Device::run() {
-    uint32_t seen = regs_.completed.load(std::memory_order_relaxed);
+    const auto* ring = reinterpret_cast<const sg_cmd*>(regs_.ring_base);
+    const uint64_t mask = regs_.ring_mask;
+    uint64_t get = regs_.get.load(std::memory_order_relaxed);
     uint64_t idle_start = now_cycles();
+    uint32_t gen = regs_.stats_gen.load(std::memory_order_relaxed);
 
     while (running_.load(std::memory_order_relaxed)) {
-        // Acquire pairs with the driver's release on the doorbell store and
-        // makes the mailbox contents visible to this thread. Without it this
-        // is a real bug on ARM, not a theoretical one.
-        if (regs_.doorbell.load(std::memory_order_acquire) == seen) {
+        // Acquire pairs with the driver's release store of `put` and makes
+        // every slot below it visible to this thread.
+        uint64_t put = regs_.put.load(std::memory_order_acquire);
+        if (put == get) {
+            // A stats reset while idle restarts the idle timer, so idle time
+            // from before the reset is not charged to the new window.
+            const uint32_t g = regs_.stats_gen.load(std::memory_order_acquire);
+            if (g != gen) {
+                gen = g;
+                idle_start = now_cycles();
+            }
             cpu_relax();
             continue;
         }
 
-        const uint64_t exec_start = now_cycles();
-        regs_.idle_cycles.fetch_add(exec_start - idle_start, std::memory_order_relaxed);
+        const uint64_t busy_start = now_cycles();
+        regs_.idle_cycles.fetch_add(busy_start - idle_start, std::memory_order_relaxed);
+        regs_.batches.fetch_add(1, std::memory_order_relaxed);
 
-        const int rc = execute(regs_.mailbox);
+        while (get != put) {
+            const int rc = execute(ring[get & mask]);
+            if (rc != 0) {
+                int expected = 0;
+                regs_.sticky_error.compare_exchange_strong(expected, rc, std::memory_order_relaxed);
+            }
+            ++get;
+            regs_.cmds_executed.fetch_add(1, std::memory_order_relaxed);
+            // Retire each command individually (release publishes its
+            // results) so a host waiting on an early fence is not held up
+            // by the rest of the batch. Also frees the slot for reuse.
+            regs_.get.store(get, std::memory_order_release);
+            // Keep draining if more arrived while we were busy; that still
+            // counts as one batch because we never went idle.
+            if (get == put) put = regs_.put.load(std::memory_order_acquire);
+        }
 
-        const uint64_t exec_end = now_cycles();
-        regs_.busy_cycles.fetch_add(exec_end - exec_start, std::memory_order_relaxed);
-        regs_.cmds_executed.fetch_add(1, std::memory_order_relaxed);
-        regs_.last_error.store(rc, std::memory_order_relaxed);
-
-        // Release publishes the results (VRAM writes, host DMA writes,
-        // last_error) before the driver can observe the ticket.
-        ++seen;
-        regs_.completed.store(seen, std::memory_order_release);
-        idle_start = exec_end;
+        const uint64_t busy_end = now_cycles();
+        regs_.busy_cycles.fetch_add(busy_end - busy_start, std::memory_order_relaxed);
+        idle_start = busy_end;
     }
 }
 

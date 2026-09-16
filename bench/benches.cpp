@@ -1,7 +1,8 @@
 // The five baseline microbenchmarks. Each one is designed to expose one
 // dimension of the driver stack:
 //
-//   submit  - fixed cost of getting one command to the device and back
+//   submit  - fixed cost of one API call (async) and of one round trip (sync)
+//   batch   - amortization: B commands then one sync, for increasing B
 //   memcpy  - data-movement path (staging, chunking, copies per byte)
 //   vadd    - a realistic tiny workload: copy in, compute, copy out
 //   gemm    - compute-bound work, to see when submission cost stops mattering
@@ -39,6 +40,10 @@ void bench_submit(const Options& o, Report& rep) {
         {"nop", [](sgDevPtr) { return sgDeviceSynchronize(); }}, // API-only floor
         {"fill_64B", [](sgDevPtr p) { return sgMemset(p, 0, 64); }},
         {"fill_4KiB", [](sgDevPtr p) { return sgMemset(p, 0, 4096); }},
+        {"fill_64B_sync", [](sgDevPtr p) {
+             if (auto e = sgMemset(p, 0, 64)) return e;
+             return sgDeviceSynchronize();
+         }},
     };
     for (auto& c : cases) {
         std::vector<double> lat;
@@ -51,11 +56,37 @@ void bench_submit(const Options& o, Report& rep) {
             die_on(c.fn(d), c.name);
             lat.push_back(ns_since(t0));
         }
+        die_on(sgDeviceSynchronize(), "sync");
         w.end();
         Row r{"submit", c.name, {}};
         latency_row(r, lat);
         r.metrics["ops_per_s"] = iters / (w.wall_ns() / 1e9);
         w.fill(r, iters);
+        rep.rows.push_back(r);
+    }
+    sgFree(d);
+}
+
+void bench_batch(const Options& o, Report& rep) {
+    const int total = o.quick ? 16384 : 262144;
+    sgDevPtr d = must_malloc(4096);
+    for (int B : {1, 4, 16, 64, 256, 1024}) {
+        const int rounds = total / B;
+        for (int i = 0; i < B; ++i) sgMemset(d, 0, 64);
+        sgDeviceSynchronize();
+        Window w;
+        w.begin();
+        for (int r = 0; r < rounds; ++r) {
+            for (int i = 0; i < B; ++i) die_on(sgMemset(d, i, 64), "memset");
+            die_on(sgDeviceSynchronize(), "sync");
+        }
+        w.end();
+        char name[32];
+        std::snprintf(name, sizeof name, "B=%d", B);
+        Row r{"batch", name, {}};
+        r.metrics["ns_per_op"] = w.wall_ns() / (double(rounds) * B);
+        r.metrics["us_per_batch"] = w.wall_ns() / rounds / 1e3;
+        w.fill(r, double(rounds) * B);
         rep.rows.push_back(r);
     }
     sgFree(d);
@@ -79,6 +110,7 @@ void bench_memcpy(const Options& o, Report& rep) {
             Window w;
             w.begin();
             for (int i = 0; i < iters; ++i) die_on(op(), "memcpy");
+            die_on(sgDeviceSynchronize(), "sync");
             w.end();
             char name[64];
             std::snprintf(name, sizeof name, "%s_%zuKiB", dir == 0 ? "h2d" : "d2h", bytes >> 10);
@@ -116,6 +148,7 @@ void bench_vadd(const Options& o, Report& rep) {
             t_k += std::chrono::duration<double, std::nano>(t2 - t1).count();
             t_out += std::chrono::duration<double, std::nano>(t3 - t2).count();
         }
+        die_on(sgDeviceSynchronize(), "sync");
         w.end();
         char name[32];
         std::snprintf(name, sizeof name, "n=%u", n);
@@ -142,6 +175,7 @@ void bench_gemm(const Options& o, Report& rep) {
         Window w;
         w.begin();
         for (int i = 0; i < iters; ++i) die_on(sgGemmF32(dc, da, db, d, d, d), "gemm");
+        die_on(sgDeviceSynchronize(), "sync");
         w.end();
         char name[32];
         std::snprintf(name, sizeof name, "%ux%ux%u", d, d, d);
@@ -176,6 +210,7 @@ void bench_mt(const Options& o, Report& rep) {
                     die_on(sgMemset(bufs[t], i, 4096), "memset");
                     lats[t].push_back(ns_since(t0));
                 }
+                die_on(sgDeviceSynchronize(), "sync");
                 cpu[t] = thread_cpu_ns() - c0;
             });
         go.store(1, std::memory_order_release);

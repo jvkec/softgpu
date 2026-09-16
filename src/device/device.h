@@ -18,21 +18,31 @@ namespace softgpu::device {
 
 // Memory-mapped register file ("BAR0"). Each group lives on its own cache
 // line so the producer and consumer sides do not false-share.
+//
+// STAGE 1: commands live in a ring in system memory that the driver
+// allocates and programs into `ring_base`/`ring_mask`. The driver advances
+// `put` (the doorbell: "commands up to here are valid"); the device advances
+// `get` as it retires them. `get` therefore doubles as the fence register:
+// command number N has retired once get >= N + 1. This is the GPFIFO
+// PUT/GET scheme real GPUs use.
 struct alignas(64) Registers {
+    // ---- configuration: written by the driver before power_on() ------------
+    uint64_t ring_base = 0; // address of sg_cmd[ring_mask + 1]
+    uint32_t ring_mask = 0; // depth - 1; depth is a power of two
+
     // ---- driver -> device -------------------------------------------------
-    // BASELINE: a single command slot. The driver writes the command, then
-    // rings the doorbell. Exactly one command may be in flight.
-    sg_cmd mailbox{};
-    alignas(64) std::atomic<uint32_t> doorbell{0}; // written by driver: submit ticket
+    alignas(64) std::atomic<uint64_t> put{0};
 
     // ---- device -> driver -------------------------------------------------
-    alignas(64) std::atomic<uint32_t> completed{0};  // last retired ticket
-    std::atomic<int32_t> last_error{0};              // 0 or -errno of last command
+    alignas(64) std::atomic<uint64_t> get{0};
+    std::atomic<int32_t> sticky_error{0}; // first -errno since reset, or 0
 
     // ---- telemetry --------------------------------------------------------
     alignas(64) std::atomic<uint64_t> busy_cycles{0};
     std::atomic<uint64_t> idle_cycles{0};
     std::atomic<uint64_t> cmds_executed{0};
+    std::atomic<uint64_t> batches{0}; // idle -> busy transitions
+    std::atomic<uint32_t> stats_gen{0}; // bumped by reset_stats(); engine restarts its idle timer
 };
 
 class Device {
@@ -47,7 +57,9 @@ public:
 
     // Bring the execution engine up / down. power_off() blocks until the
     // engine thread has exited; any command in flight is completed first.
-    void power_on();
+    // `cpu` >= 0 pins the engine thread to that CPU (Linux only); the
+    // benchmark harness uses it to make cross-core placement reproducible.
+    void power_on(int cpu = -1);
     void power_off();
 
     void reset_stats();

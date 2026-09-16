@@ -5,6 +5,7 @@
 
 #include "softgpu/sg_runtime.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 
@@ -14,6 +15,15 @@
 namespace {
 
 int g_fd = -1;
+// Highest fence handed out so far. Submitters race to publish theirs after
+// the ioctl returns, so keep the max rather than the last writer's value;
+// sgDeviceSynchronize() then means "everything any thread has submitted".
+std::atomic<uint64_t> g_last_fence{0};
+
+void publish_fence(uint64_t f) {
+    uint64_t cur = g_last_fence.load(std::memory_order_relaxed);
+    while (cur < f && !g_last_fence.compare_exchange_weak(cur, f, std::memory_order_relaxed)) {}
+}
 
 sgError_t from_errno(int rc) {
     switch (rc) {
@@ -32,7 +42,9 @@ sgError_t submit(sg_cmd cmd, uint64_t host_ptr = 0) {
     sg_submit_args a{};
     a.cmd = cmd;
     a.host_ptr = host_ptr;
-    return from_errno(sg_drv_ioctl(g_fd, SG_IOC_SUBMIT, &a));
+    int rc = sg_drv_ioctl(g_fd, SG_IOC_SUBMIT, &a);
+    if (rc == 0) publish_fence(a.fence);
+    return from_errno(rc);
 }
 
 sg_cmd make_cmd(sg_opcode op) {
@@ -55,6 +67,7 @@ sgError_t sgInit(void) {
         return rc ? from_errno(rc) : SG_ERR_DEVICE;
     }
     g_fd = fd;
+    g_last_fence.store(0, std::memory_order_relaxed);
     return SG_OK;
 }
 
@@ -134,8 +147,9 @@ sgError_t sgGemmF32(sgDevPtr c_, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n,
 }
 
 sgError_t sgDeviceSynchronize(void) {
-    // BASELINE: all submissions are synchronous; nothing to wait for.
-    return g_fd < 0 ? SG_ERR_NOT_INITIALIZED : SG_OK;
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    sg_wait_args w{g_last_fence.load(std::memory_order_relaxed)};
+    return from_errno(sg_drv_ioctl(g_fd, SG_IOC_WAIT, &w));
 }
 
 sgError_t sgGetStats(sgStats_t* out) {
@@ -147,7 +161,10 @@ sgError_t sgGetStats(sgStats_t* out) {
         out->device_busy_cycles = s.busy_cycles;
         out->device_idle_cycles = s.idle_cycles;
         out->device_cmds_executed = s.cmds_executed;
+        out->device_batches = s.batches;
         out->driver_submits = s.submits;
+        out->driver_waits = s.waits;
+        out->driver_stalls = s.stalls;
         out->bytes_h2d = s.bytes_h2d;
         out->bytes_d2h = s.bytes_d2h;
     }

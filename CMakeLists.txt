@@ -53,3 +53,6 @@ target_link_libraries(sgtest PRIVATE sg_runtime Threads::Threads)
 
 enable_testing()
 add_test(NAME runtime COMMAND sgtest)
+# Same tests with a 2-slot ring: every second submit hits backpressure.
+add_test(NAME runtime_ring2 COMMAND sgtest)
+set_tests_properties(runtime_ring2 PROPERTIES ENVIRONMENT "SG_RING_DEPTH=2")
