@@ -64,22 +64,30 @@ check_host_quiet() {
   echo "canary round trip ${ns} ns, host load $(host_load): ok"
 }
 
-# Merge several runs of the same selection into one results file, keeping,
-# per row, every metric from the run with the lowest wall_ms (see the note in
-# bench/main.cpp on bimodal placement), and attach provenance.
+# Merge runs into one results file. Files are grouped by benchmark (the
+# first word of the filename); within a group, per row, every metric comes
+# from the run with the lowest wall_ms (see bench/main.cpp on bimodal
+# placement); groups are concatenated. Provenance goes in "meta".
 merge() {
   python3 - "$@" <<'PYEOF'
-import json, sys, datetime
-out, load, env, runs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
-ds = [json.load(open(p)) for p in runs]
-best = ds[0]
-for d in ds[1:]:
-    for i, row in enumerate(d["rows"]):
-        if row["wall_ms"] < best["rows"][i]["wall_ms"]:
-            best["rows"][i] = row
-best["meta"] = {"host_loadavg_1m": float(load), "env": env, "runs": len(runs),
-                "date": datetime.datetime.now().isoformat(timespec="seconds")}
-json.dump(best, open(out, "w"), indent=1)
+import json, sys, datetime, os, collections
+out, load, env, runs, files = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:]
+groups = collections.OrderedDict()
+for f in sorted(files):
+    groups.setdefault(os.path.basename(f).split("-")[0], []).append(json.load(open(f)))
+rows, tag = [], None
+for _, ds in groups.items():
+    tag = ds[0]["tag"]
+    best = ds[0]["rows"]
+    for d in ds[1:]:
+        for i, row in enumerate(d["rows"]):
+            if row["wall_ms"] < best[i]["wall_ms"]:
+                best[i] = row
+    rows += best
+json.dump({"tag": tag, "meta": {"host_loadavg_1m": float(load), "env": env, "runs": runs,
+           "one_process_per_bench": True,
+           "date": datetime.datetime.now().isoformat(timespec="seconds")}, "rows": rows},
+          open(out, "w"), indent=1)
 PYEOF
 }
 
@@ -93,14 +101,28 @@ case "$cmd" in
     check_host_quiet
     mkdir -p "$HERE/results"
     runs=${SG_RUNS:-5}
-    tmp=$(mktemp -d)
-    for k in $(seq 1 "$runs"); do
-      remote "cd $SRC && env ${SG_ENV:-} $BUILD/release/sgbench $* --tag $tag --json /tmp/sg-$tag-$k.json >/dev/null 2>&1; sleep 2"
-      scp -q "$VM:/tmp/sg-$tag-$k.json" "$tmp/$k.json"
+    # Split benchmarks from flags; expand "all". Each benchmark runs in its
+    # own process so none inherits the previous one's thread placement.
+    sels=(); flags=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        all) sels+=(submit batch memcpy vadd gemm mt) ;;
+        submit|batch|memcpy|vadd|gemm|mt) sels+=("$1") ;;
+        --json|--tag|--threads|--repeat) flags+=("$1" "$2"); shift ;;
+        *) flags+=("$1") ;;
+      esac
+      shift
     done
-    merge "$HERE/results/$tag.json" "$(host_load)" "${SG_ENV:-}" "$tmp"/*.json
+    tmp=$(mktemp -d)
+    for s in "${sels[@]}"; do
+      for k in $(seq 1 "$runs"); do
+        remote "cd $SRC && env ${SG_ENV:-} $BUILD/release/sgbench $s ${flags[*]} --tag $tag --json /tmp/sg-$tag-$s-$k.json >/dev/null 2>&1; sleep 1"
+        scp -q "$VM:/tmp/sg-$tag-$s-$k.json" "$tmp/$s-$k.json"
+      done
+    done
+    merge "$HERE/results/$tag.json" "$(host_load)" "${SG_ENV:-}" "$runs" "$tmp"/*.json
     rm -rf "$tmp"
-    echo "saved results/$tag.json ($runs runs, host load $(host_load))"
+    echo "saved results/$tag.json ($runs runs per benchmark, host load $(host_load))"
     ;;
   canary) configure_and_build release >/dev/null; echo "$(canary_ns) ns" ;;
   shell) ssh -t "$VM" "cd $SRC && exec \$SHELL -l" ;;

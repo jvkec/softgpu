@@ -82,11 +82,15 @@ the same cluster, a doorbell round trip costs ~208 ns; across clusters,
 ~583 ns — 2.8× — because a cache-line handoff has to cross the fabric. The
 guest cannot see or control host placement, and it changes over time (the
 same guest-pinned vCPU pair reads 208 ns one minute and 584 ns the next).
-Medians over a bimodal distribution are meaningless, so `sgbench --repeat`
-keeps, per row, every metric from the fastest pass, and `scripts/vm.sh`
-merges several separate processes the same way. Runs are gated by a canary
-(one round trip) before and after; a run that flips mid-way is discarded.
-Results files record host load and run count in `meta`.
+Placement is also sticky per process and *workload-dependent*: after a
+64 MiB streaming copy or a long GEMM the host tends to migrate the two
+threads apart and leave them there, so a benchmark that runs after `memcpy`
+in the same process inherits slow placement. Medians over a bimodal
+distribution are meaningless, so `sgbench --repeat` keeps, per row, every
+metric from the fastest pass; `scripts/vm.sh` runs every benchmark in its
+own process, five times, and merges the same way. Runs are gated by a
+canary (one round trip) before and after; a run that flips mid-way is
+discarded. Results files record host load, run count and date in `meta`.
 
 **Host load leaks in.** Spotlight indexing the new build trees tripled every
 latency while host CPU was 70% idle. `build/` is now marked non-indexable and
@@ -94,7 +98,8 @@ the canary catches it.
 
 ## Results
 
-Baseline vs ring, same-cluster mode, best of 15 passes across 5 processes.
+Baseline vs ring (1024 slots), same-cluster mode, best of 15 passes across
+5 processes per benchmark.
 Full data: [`results/baseline.json`](../../results/baseline.json),
 [`results/ring.json`](../../results/ring.json).
 
@@ -102,9 +107,9 @@ Full data: [`results/baseline.json`](../../results/baseline.json),
 
 | variant | baseline p50 | ring p50 | baseline ops/s | ring ops/s | host CPU ns/op |
 |---|---:|---:|---:|---:|---:|
-| fill_64B (async) | 250 | **84** | 3.49 M | **7.82 M** | 286 → 128 |
-| fill_4KiB (async) | 292 | **83** | 2.77 M | **8.54 M** | 362 → 117 |
-| fill_64B_sync (round trip) | 250 | 208 | 3.50 M | 4.02 M | 286 → 249 |
+| fill_64B (async) | 250 | **84** | 3.69 M | **8.20 M** | 271 → 122 |
+| fill_4KiB (async) | 333 | **83** | 2.64 M | **8.85 M** | 379 → 113 |
+| fill_64B_sync (round trip) | 250 | 208 | 3.46 M | 4.16 M | 289 → 240 |
 
 An asynchronous submit costs 84 ns — twice the API floor of 42 ns — and the
 p99 is 125 ns. The round trip itself shed ~40 ns because the protocol got
@@ -114,52 +119,56 @@ simpler (no ticket handshake, one release store each way).
 
 | B | baseline ns/op | ring ns/op | waits/op | avg cmds per device wake | device util |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 224 | 183 | 1.000 | 1.00 | 0.17 → 0.33 |
-| 4 | 209 | 104 | 0.250 | 1.38 | 0.18 → 0.54 |
-| 16 | 205 | 97 | 0.062 | 1.10 | 0.18 → 0.59 |
-| 64 | 205 | 95 | 0.016 | 1.04 | 0.18 → 0.60 |
-| 256 | 204 | 94 | 0.004 | 1.02 | 0.18 → 0.61 |
-| 1024 | 204 | 94 | 0.001 | 1.02 | 0.18 → 0.62 |
+| 1 | 223 | 166 | 1.000 | 1.00 | 0.17 → 0.36 |
+| 4 | 212 | 89 | 0.250 | 2.00 | 0.17 → 0.56 |
+| 16 | 208 | 77 | 0.062 | 2.74 | 0.18 → 0.74 |
+| 64 | 209 | 74 | 0.016 | 2.80 | 0.18 → 0.78 |
+| 256 | 208 | 73 | 0.004 | 2.81 | 0.18 → 0.80 |
+| 1024 | 208 | 72 | 0.001 | 2.87 | 0.18 → 0.80 |
 
-Cost per command halves as soon as the host stops waiting (B ≥ 4), then
-flattens at ~94 ns. That floor is the *submitter's* per-command work — lock,
-validation, slot write, doorbell — not the device's. `avg_batch ≈ 1` says
-the device drains each 64-byte fill before the next one arrives: it is
-faster than the host can feed it. **The bottleneck has moved from the round
-trip to the submission path itself.**
+Cost per command more than halves as soon as the host stops waiting
+(B ≥ 4), then flattens at ~72 ns. That floor is the *submitter's*
+per-command work — lock, validation, slot write, doorbell — not the
+device's: with ~2.8 commands per wake the device is keeping up comfortably
+and still sits idle 20% of the time. **The bottleneck has moved from the
+round trip to the submission path itself.**
 
 ### Concurrent submitters (`mt`, 4 KiB memset per op)
 
 | threads | baseline ops/s | ring ops/s | baseline p99 | ring p99 | host CPU ns/op |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 2.66 M | **5.60 M** | 584 ns | 334 ns | 364 → 164 |
-| 2 | 1.44 M | **3.49 M** | 11.3 µs | 1.46 µs | 787 → 466 |
-| 4 | 1.17 M | **2.94 M** | 71.3 µs | 1.88 µs | 1,349 → 621 |
-| 8 | 0.98 M | **2.92 M** | 234 µs | 34.8 µs | 2,215 → 1,006 |
+| 1 | 3.03 M | **7.65 M** | 292 ns | 125 ns | 320 → 124 |
+| 2 | 2.42 M | **6.38 M** | 1.13 µs | 0.75 µs | 482 → 308 |
+| 4 | 1.33 M | **4.28 M** | 71.9 µs | 1.46 µs | 1,261 → 483 |
+| 8 | 1.05 M | **3.83 M** | 223 µs | 14.0 µs | 2,154 → 805 |
 
-Throughput 2–3×, tail latency down 85–97%, half the CPU per op. But look at
-the shape: the ring is flat from 2 to 8 threads. The lock convoy is gone
-(threads no longer hold the lock across a round trip) but the lock itself
-still serializes every submit. That is stage 4.
+Throughput 2.5–3.6×, tail latency down 94–98% at 4+ threads, CPU per op
+down ~60%. But look at the shape: the ring still *loses* half its
+throughput from 1 to 8 threads. The lock convoy is gone (threads no longer
+hold the lock across a round trip) but the lock itself still serializes
+every submit, and at 8 threads on 6 vCPUs the scheduler joins in. That is
+stage 4.
 
 ### Real workload (`vadd`: H2D, H2D, VADD, D2H)
 
 | n | baseline µs/iter | ring µs/iter | waits/iter | kernel fraction |
 |---:|---:|---:|---:|---:|
-| 1,024 | 7.00 | 6.34 (2.4–2.8 in isolation, see below) | 4 → 2 | 0.086 → 0.035 |
-| 65,536 | 45.3 | 45.4 | 4 → 2 | 0.20 → 0.005 |
-| 1,048,576 | 804 | 796 | 4 → 2 | 0.21 → 0.000 |
-| 16,777,216 | 14,337 | 14,275 | 49 → 47 | 0.20 → 0.000 |
+| 1,024 | 3.23 | **2.58** | 4 → 2 | 0.12 → 0.04 |
+| 65,536 | 44.2 | 42.1 | 4 → 2 | 0.22 → 0.002 |
+| 1,048,576 | 779 | 795 | 4 → 2 | 0.21 → 0.000 |
+| 16,777,216 | 14,159 | 14,198 | 49 → 47 | 0.20 → 0.000 |
 
 Waits per iteration halved exactly as predicted (VADD and the first H2D no
-longer block), and the kernel's *visible* cost vanished because it overlaps
-with the host's D2H submission. But wall time barely moved: the copies are
-still serialized through one staging buffer and still dominate. Stage 3.
+longer block), the kernel's *visible* cost vanished because it overlaps
+with the host's D2H submission, and the smallest case gained 20%. Above
+that, wall time did not move: the copies are still serialized through one
+staging buffer and still dominate. Stage 3.
 
 ### Unchanged, as expected
 
-`memcpy` bandwidth within ±3% at every size (the staging path is the same);
-`gemm` within ±1% (compute-bound work never cared about submission cost).
+`memcpy` bandwidth within +0–8% at ≥ 1 MiB (the staging path is the same;
+small copies gain a little from the cheaper doorbell); `gemm` within ±1%
+(compute-bound work never cared about submission cost).
 
 ## Ring depth
 
@@ -169,39 +178,44 @@ only. Files: `results/ring-d{16,64,256,4096}.json` and `results/ring.json`
 
 | depth | batch B≥64 ns/op | avg cmds/wake | mt 8-thread ops/s | mt 8-thread p99 | stalls/op (8 thr) |
 |---:|---:|---:|---:|---:|---:|
-| 16 | 95 | 1.02 | 2.58 M | 68 µs | 0.031 |
-| 64 | 96 | 1.03 | 2.64 M | 61 µs | 0.007 |
-| 256 | 95 | 1.04 | 2.92 M | 35 µs | 0.001 |
-| **1024** | **76** | **2.4** | **3.30 M** | **23–31 µs** | 0.000 |
-| 4096 | 80 | 2.2 | 3.63 M | 32 µs | 0.000 |
+| 16 | 94 | 1.02 | 2.72 M | 66 µs | 0.005 |
+| 64 | 94 | 1.02 | 2.88 M | 59 µs | 0.004 |
+| 256 | 94 | 1.03 | 3.27 M | 33 µs | 0.002 |
+| **1024** | **74** | **2.8** | **3.83 M** | **14 µs** | 0.000 |
+| 4096 | 66 | 6.4 | 3.62 M | 25 µs | 0.000 |
 
-Below 256 slots, contended submitters hit a full ring and stall. At 1024 the
-device finally gets to fall behind and batch (2.4 commands per wake), which
-is worth ~20% per command and ~13% aggregate throughput over 256. 4096 buys
-nothing further outside the noise, costs 4× the memory (256 KiB vs 64 KiB)
-and 4× the worst-case drain time behind a `sgDeviceSynchronize`.
+Up to 256 slots the device retires each command before the next arrives
+(one command per wake) and contended submitters occasionally hit a full
+ring. At 1024 the device finally gets to fall behind and batch (2.8
+commands per wake): 21% cheaper per command, 17% more aggregate throughput
+and half the tail latency versus 256. 4096 batches deeper still and shaves
+another 10% per command, but its multithreaded throughput and p99 are no
+better, it costs 4× the memory (256 KiB vs 64 KiB), and it quadruples the
+worst-case drain behind a `sgDeviceSynchronize`.
 
-**Default depth: 1024.** Round trips are unaffected by depth, so latency-
-sensitive callers lose nothing.
+**Default depth: 1024.** Round trips (`fill_64B_sync`, 208 ns) and async
+submit cost (84 ns) are identical at every depth, so latency-sensitive
+callers lose nothing.
 
-## Open questions
+## Anomalies found and resolved
 
-Two anomalies survived the measurement clean-up and are recorded rather than
-hidden:
+Two effects survived the first measurement clean-up and were recorded
+rather than smoothed over; both turned out to be the same thing.
 
-1. **`vadd n=1024` depends on what ran before it.** In a process that runs
-   only `vadd` (or `batch` then `vadd`) it costs 2.4–2.8 µs; after `memcpy`
-   or `gemm` in the same process it costs ~6 µs, reproducibly, at every ring
-   depth. The `frac_*` breakdown says the extra time is in the two H2D
-   calls. Leading hypothesis: the 64 MiB `memcpy` pass leaves the staging
-   buffer's lines owned by the device's cluster, and cross-cluster
-   write-invalidations on the following 4 KiB `memcpy`s into staging are
-   what we are paying for. Pinned host memory (stage 3) removes the staging
-   write entirely, which will settle it.
-2. **`batch B=1` vs `submit fill_64B_sync`** are the same operation, yet
-   `batch B=1` occasionally reads 2× slower (460–480 ns) in runs whose
-   `submit` rows are in fast mode. Placement flipping during a pass is the
-   suspect; the post-run canary should catch it going forward.
+1. **`vadd n=1024` depended on what ran before it in the same process:**
+   ~2.5 µs after `batch`, ~6.6 µs after `memcpy`, `gemm`, or nothing. The
+   round-trip canary measured *after* each benchmark tracked it exactly
+   (209 ns after `batch`, 540–625 ns after everything else). Workloads that
+   stream memory or run long get the two threads migrated onto different
+   host clusters, and they stay there. It was placement, not caching — the
+   staging-buffer hypothesis this record briefly held was wrong.
+2. **`batch B=1` read 2× slower than the equivalent `submit fill_64B_sync`**
+   in some runs, for the same reason: it inherited the previous benchmark's
+   placement.
+
+Running every benchmark in its own process removed both. With that in
+place, `vadd n=1024` is 3.23 → 2.58 µs and `batch B=1` is 166 ns against a
+208 ns synchronous round trip.
 
 ## Consequences
 
@@ -211,8 +225,8 @@ hidden:
   tests already did).
 * `sgFree` drains the queue. Cheap today; wrong once there are multiple
   contexts. Deferred frees keyed on fences come with stage 3.
-* The new floor is ~90 ns per command of submitter work under a global lock,
-  and the device outruns it. The next measurable wins are, in order:
+* The new floor is ~72 ns per command of submitter work under a global lock,
+  and the device keeps up with it while idle 20% of the time. The next measurable wins are, in order:
   overlap the copies (stage 3, `vadd` and `memcpy` are 2× on the table),
   stop spinning (stage 2, `cpu_ns_per_op ≈ wall/op` everywhere), and remove
   the lock (stage 4, flat `mt` scaling).
