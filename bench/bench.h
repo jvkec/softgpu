@@ -104,6 +104,9 @@ struct Window {
     double dev_batches() const { return double(s1.device_batches - s0.device_batches); }
     double waits() const { return double(s1.driver_waits - s0.driver_waits); }
     double stalls() const { return double(s1.driver_stalls - s0.driver_stalls); }
+    double staging_waits() const { return double(s1.staging_waits - s0.staging_waits); }
+    double bytes_direct() const { return double(s1.bytes_direct - s0.bytes_direct); }
+    double bytes_staged() const { return double(s1.bytes_staged - s0.bytes_staged); }
 
     // Fill the standard metrics every benchmark reports.
     void fill(Row& r, double ops) const {
@@ -113,6 +116,9 @@ struct Window {
         r.metrics["dev_cmds_per_op"] = dev_cmds() / ops;
         r.metrics["waits_per_op"] = waits() / ops;
         r.metrics["stalls_per_op"] = stalls() / ops;
+        r.metrics["staging_waits_per_op"] = staging_waits() / ops;
+        if (bytes_direct() + bytes_staged() > 0)
+            r.metrics["direct_frac"] = bytes_direct() / (bytes_direct() + bytes_staged());
         r.metrics["avg_batch"] = dev_cmds() / std::max(1.0, dev_batches());
     }
 };
@@ -133,5 +139,6 @@ void bench_memcpy(const Options&, Report&);
 void bench_vadd(const Options&, Report&);
 void bench_gemm(const Options&, Report&);
 void bench_mt(const Options&, Report&);
+void bench_alloc(const Options&, Report&);
 
 } // namespace bench

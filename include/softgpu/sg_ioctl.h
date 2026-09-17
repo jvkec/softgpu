@@ -18,9 +18,10 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   2u
+#define SG_ABI_VERSION   3u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
-#define SG_STAGING_SIZE  (4ull << 20)   /* BASELINE: one 4 MiB host bounce buffer */
+#define SG_STAGING_SLOTS 8u             /* default pageable-copy staging pool ...    */
+#define SG_STAGING_CHUNK (256ull << 10) /* ... 8 x 256 KiB, from the sweep in ADR 002 */
 #define SG_ALLOC_ALIGN   256u           /* VRAM allocation granularity            */
 
 enum sg_opcode {
@@ -55,9 +56,9 @@ struct sg_cmd {
 
 struct sg_query_args {
     uint32_t abi_version;
-    uint32_t reserved;
+    uint32_t staging_slots;
     uint64_t vram_size;
-    uint64_t staging_size;
+    uint64_t staging_chunk;
 };
 
 struct sg_alloc_args {
@@ -69,10 +70,25 @@ struct sg_free_args {
     uint64_t addr;
 };
 
+#define SG_SUBMIT_DIRECT 1u /* out_flags: DMA went straight to/from the user buffer */
+
 struct sg_submit_args {
     struct sg_cmd cmd;
-    uint64_t host_ptr; /* in:  user buffer for COPY_H2D/COPY_D2H, 0 otherwise  */
-    uint64_t fence;    /* out: fence value that retires when this command does */
+    uint64_t host_ptr;  /* in:  user buffer for COPY_H2D/COPY_D2H, 0 otherwise  */
+    uint64_t fence;     /* out: fence value that retires when this command does */
+    uint32_t out_flags; /* out: SG_SUBMIT_*                                     */
+    uint32_t reserved;
+};
+
+/*
+ * Pin a host range so the device may DMA to/from it directly. Ranges may not
+ * overlap; UNPIN takes the exact addr given to PIN. Unpinning a range that an
+ * in-flight command still references is deferred until that command retires.
+ */
+struct sg_pin_args {
+    uint64_t addr;
+    uint64_t size;
+    uint64_t fence; /* out (UNPIN): the range is unreferenced once this retires */
 };
 
 /* Block until the device has retired every command up to `fence`. */
@@ -88,8 +104,11 @@ struct sg_stats_args {
     uint64_t submits;       /* driver: SG_IOC_SUBMIT calls                      */
     uint64_t waits;         /* driver: times the host blocked on a fence        */
     uint64_t stalls;        /* driver: times submission blocked on a full ring  */
+    uint64_t staging_waits; /* driver: times the host blocked for a staging slot */
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
+    uint64_t bytes_direct;  /* of the above, DMA'd to/from pinned memory        */
+    uint64_t bytes_staged;  /* of the above, bounced through the staging pool   */
 };
 
 /*
@@ -103,7 +122,9 @@ enum sg_ioc {
     SG_IOC_SUBMIT      = 0x5304, /* sg_submit_args */
     SG_IOC_STATS       = 0x5305, /* sg_stats_args  */
     SG_IOC_RESET_STATS = 0x5306, /* no argument    */
-    SG_IOC_WAIT        = 0x5307  /* sg_wait_args   */
+    SG_IOC_WAIT        = 0x5307, /* sg_wait_args   */
+    SG_IOC_PIN         = 0x5308, /* sg_pin_args    */
+    SG_IOC_UNPIN       = 0x5309  /* sg_pin_args (size ignored) */
 };
 
 #ifdef __cplusplus

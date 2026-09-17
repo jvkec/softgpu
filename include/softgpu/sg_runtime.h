@@ -15,6 +15,12 @@ extern "C" {
 
 typedef uint64_t sgDevPtr; /* opaque device address (VRAM offset) */
 
+/*
+ * Streams order work. Only the default stream (NULL) exists yet; the type is
+ * declared now so the *Async signatures do not change when real streams land.
+ */
+typedef struct sgStream* sgStream_t;
+
 typedef enum sgError {
     SG_OK = 0,
     SG_ERR_NOT_INITIALIZED,
@@ -34,21 +40,45 @@ typedef struct sgStats {
     uint64_t driver_submits;
     uint64_t driver_waits;     /* times the host blocked waiting on the device */
     uint64_t driver_stalls;    /* times submission blocked on a full queue     */
+    uint64_t staging_waits;    /* times the host blocked for a staging slot    */
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
+    uint64_t bytes_direct;     /* copied straight to/from pinned host memory   */
+    uint64_t bytes_staged;     /* bounced through the staging pool             */
 } sgStats_t;
 
 /* Lifecycle. Not thread-safe with respect to each other. */
 sgError_t sgInit(void);
 sgError_t sgShutdown(void);
 
-/* Memory management. */
+/* Device memory. sgFree is safe while work referencing the memory is in
+ * flight: the memory is recycled only after that work retires. */
 sgError_t sgMalloc(sgDevPtr* out, size_t bytes);
 sgError_t sgFree(sgDevPtr ptr);
+
+/*
+ * Pinned host memory. Copies to/from pinned memory are DMA'd directly (no
+ * staging copy) and may be asynchronous. sgMallocHost allocates and pins;
+ * sgHostRegister pins memory you already own (page-aligned ranges recommended).
+ */
+sgError_t sgMallocHost(void** out, size_t bytes);
+sgError_t sgFreeHost(void* ptr);
+sgError_t sgHostRegister(void* ptr, size_t bytes);
+sgError_t sgHostUnregister(void* ptr);
+
+/*
+ * Copies. The synchronous forms return when the host buffer may be reused
+ * (H2D) or the data has arrived (D2H). The *Async forms return as soon as
+ * the copy is queued when the host buffer is pinned — do not touch it until
+ * sgDeviceSynchronize() — and behave like the synchronous forms for pageable
+ * memory. `stream` must be NULL for now.
+ */
 sgError_t sgMemset(sgDevPtr dst, int value, size_t bytes);
 sgError_t sgMemcpyH2D(sgDevPtr dst, const void* src, size_t bytes);
 sgError_t sgMemcpyD2H(void* dst, sgDevPtr src, size_t bytes);
 sgError_t sgMemcpyD2D(sgDevPtr dst, sgDevPtr src, size_t bytes);
+sgError_t sgMemcpyH2DAsync(sgDevPtr dst, const void* src, size_t bytes, sgStream_t stream);
+sgError_t sgMemcpyD2HAsync(void* dst, sgDevPtr src, size_t bytes, sgStream_t stream);
 
 /* Compute. All operands are f32 in device memory. */
 sgError_t sgVaddF32(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t n);

@@ -160,6 +160,142 @@ static void test_async_ordering() {
     CHECK_OK(sgFree(d)); CHECK_OK(sgFree(a)); CHECK_OK(sgFree(b)); CHECK_OK(sgFree(c));
 }
 
+static void test_pinned_roundtrip(size_t bytes) {
+    uint8_t *src = nullptr, *dst = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&src), bytes));
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&dst), bytes));
+    for (size_t i = 0; i < bytes; ++i) src[i] = static_cast<uint8_t>(i * 13 + 5);
+    std::memset(dst, 0, bytes);
+    sgDevPtr d = 0;
+    CHECK_OK(sgMalloc(&d, bytes));
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemcpyH2D(d, src, bytes));
+    CHECK_OK(sgMemcpyD2H(dst, d, bytes));
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(std::memcmp(src, dst, bytes) == 0);
+    CHECK(s1.bytes_direct - s0.bytes_direct == 2 * bytes); // both went direct
+    CHECK(s1.bytes_staged == s0.bytes_staged);
+    CHECK_OK(sgFree(d));
+    CHECK_OK(sgFreeHost(src));
+    CHECK_OK(sgFreeHost(dst));
+}
+
+static void test_host_register() {
+    const size_t n = 1 << 20;
+    std::vector<uint8_t> buf(n + 4096), out(n);
+    for (size_t i = 0; i < buf.size(); ++i) buf[i] = uint8_t(i);
+    sgDevPtr d = 0;
+    CHECK_OK(sgMalloc(&d, n));
+    CHECK_OK(sgHostRegister(buf.data(), n)); // pin only the first n bytes
+    CHECK(sgHostRegister(buf.data() + 100, 10) == SG_ERR_INVALID_VALUE); // overlap
+
+    sgStats_t s0{}, s1{}, s2{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemcpyH2D(d, buf.data(), n)); // fully inside the pin: direct
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(s1.bytes_direct - s0.bytes_direct == n);
+    // Straddles the end of the pinned range: must fall back to staging and
+    // still be correct.
+    CHECK_OK(sgMemcpyH2D(d, buf.data() + 4096, n));
+    CHECK_OK(sgGetStats(&s2));
+    CHECK(s2.bytes_staged - s1.bytes_staged == n);
+    CHECK_OK(sgMemcpyD2H(out.data(), d, n));
+    CHECK(std::memcmp(out.data(), buf.data() + 4096, n) == 0);
+
+    // Unregister while a DMA from the range is in flight, then reuse it.
+    CHECK_OK(sgMemcpyH2DAsync(d, buf.data(), n, nullptr));
+    CHECK_OK(sgHostUnregister(buf.data()));
+    CHECK(sgHostUnregister(buf.data()) == SG_ERR_INVALID_VALUE);
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK_OK(sgMemcpyD2H(out.data(), d, n));
+    CHECK(std::memcmp(out.data(), buf.data(), n) == 0);
+    CHECK_OK(sgFree(d));
+}
+
+static void test_async_pinned_pipeline() {
+    // H2D a, H2D b (async, pinned), VADD, D2H c (async, pinned), one sync.
+    const uint32_t n = 1 << 18;
+    float *a = nullptr, *b = nullptr, *c = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&a), n * 4));
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&b), n * 4));
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&c), n * 4));
+    for (uint32_t i = 0; i < n; ++i) { a[i] = float(i); b[i] = 2.0f * float(i); c[i] = -1.0f; }
+    sgDevPtr da = 0, db = 0, dc = 0;
+    CHECK_OK(sgMalloc(&da, n * 4)); CHECK_OK(sgMalloc(&db, n * 4)); CHECK_OK(sgMalloc(&dc, n * 4));
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    CHECK_OK(sgMemcpyH2DAsync(da, a, n * 4, nullptr));
+    CHECK_OK(sgMemcpyH2DAsync(db, b, n * 4, nullptr));
+    CHECK_OK(sgVaddF32(dc, da, db, n));
+    CHECK_OK(sgMemcpyD2HAsync(c, dc, n * 4, nullptr));
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK_OK(sgGetStats(&s1));
+    bool ok = true;
+    for (uint32_t i = 0; i < n && ok; ++i) ok = (c[i] == 3.0f * float(i));
+    CHECK(ok);
+    CHECK(s1.driver_waits - s0.driver_waits == 1); // only the final sync blocked
+    // A non-null stream is rejected until streams exist.
+    CHECK(sgMemcpyH2DAsync(da, a, 4, reinterpret_cast<sgStream_t>(1)) == SG_ERR_INVALID_VALUE);
+    CHECK_OK(sgFree(da)); CHECK_OK(sgFree(db)); CHECK_OK(sgFree(dc));
+    CHECK_OK(sgFreeHost(a)); CHECK_OK(sgFreeHost(b)); CHECK_OK(sgFreeHost(c));
+}
+
+static void test_deferred_free() {
+    // A long GEMM is writing `c` when we free it and immediately reallocate.
+    // The allocator must not hand the same memory out until the GEMM retired,
+    // otherwise the GEMM's late writes would clobber our memset.
+    const uint32_t d = 512;
+    const size_t bytes = size_t(d) * d * 4;
+    sgDevPtr a = 0, b = 0, c = 0;
+    CHECK_OK(sgMalloc(&a, bytes)); CHECK_OK(sgMalloc(&b, bytes)); CHECK_OK(sgMalloc(&c, bytes));
+    CHECK_OK(sgMemset(a, 0, bytes)); CHECK_OK(sgMemset(b, 0, bytes));
+    CHECK_OK(sgGemmF32(c, a, b, d, d, d)); // ~14 ms, async
+    CHECK_OK(sgFree(c));
+    sgDevPtr c2 = 0;
+    CHECK_OK(sgMalloc(&c2, bytes));
+    // With first-fit and everything else live, c2 either reuses c's slot
+    // (only safe if the driver deferred the free) or takes fresh space.
+    CHECK_OK(sgMemset(c2, 0x7f, bytes));
+    CHECK_OK(sgDeviceSynchronize());
+    std::vector<uint8_t> out(bytes);
+    CHECK_OK(sgMemcpyD2H(out.data(), c2, bytes));
+    CHECK(std::all_of(out.begin(), out.end(), [](uint8_t v) { return v == 0x7f; }));
+    // Now that the GEMM has retired, the original c has been reclaimed and,
+    // being the lowest free block, is what first-fit hands out next.
+    CHECK_OK(sgFree(c2));
+    sgDevPtr c3 = 0;
+    CHECK_OK(sgMalloc(&c3, bytes));
+    CHECK(c3 == c);
+    CHECK_OK(sgFree(a)); CHECK_OK(sgFree(b)); CHECK_OK(sgFree(c3));
+}
+
+static void test_concurrent_pinned_submitters() {
+    const int T = 8, iters = 100;
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, &bad] {
+            const size_t n = 1 << 16;
+            uint8_t *src = nullptr, *dst = nullptr;
+            if (sgMallocHost(reinterpret_cast<void**>(&src), n) != SG_OK ||
+                sgMallocHost(reinterpret_cast<void**>(&dst), n) != SG_OK) { bad[t] = 1; return; }
+            sgDevPtr d = 0;
+            if (sgMalloc(&d, n) != SG_OK) { bad[t] = 1; return; }
+            for (int i = 0; i < iters && !bad[t]; ++i) {
+                std::memset(src, t * 16 + (i & 15), n);
+                if (sgMemcpyH2D(d, src, n) != SG_OK || sgMemcpyD2H(dst, d, n) != SG_OK ||
+                    std::memcmp(src, dst, n) != 0)
+                    bad[t] = 1;
+            }
+            sgFree(d);
+            sgFreeHost(src);
+            sgFreeHost(dst);
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+}
+
 static void test_concurrent_submitters() {
     // Many threads hammering the driver; every thread verifies its own data.
     const int T = 8, iters = 200;
@@ -196,6 +332,11 @@ int main() {
         {"validation", test_validation},
         {"alloc_reuse_and_oom", test_alloc_reuse_and_oom},
         {"async_ordering", test_async_ordering},
+        {"pinned_roundtrip", [] { test_pinned_roundtrip(1); test_pinned_roundtrip(4096); test_pinned_roundtrip(64u << 20); }},
+        {"host_register", test_host_register},
+        {"async_pinned_pipeline", test_async_pinned_pipeline},
+        {"deferred_free", test_deferred_free},
+        {"concurrent_pinned_submitters", test_concurrent_pinned_submitters},
         {"concurrent_submitters", test_concurrent_submitters},
     };
     for (auto& t : tests) {

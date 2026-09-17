@@ -16,7 +16,13 @@ public:
     VramAllocator(uint64_t size, uint64_t align);
 
     std::optional<uint64_t> alloc(uint64_t bytes);
-    bool free(uint64_t addr);
+    bool free(uint64_t addr); // detach + release
+
+    // Two-phase free for memory that in-flight work may still reference:
+    // detach() removes it from the live set (owns_range() stops matching)
+    // without recycling it; release() returns it to the free list later.
+    bool detach(uint64_t addr, uint64_t* size_out);
+    void release(uint64_t addr, uint64_t size);
 
     // True if [addr, addr+len) lies entirely inside one live allocation.
     bool owns_range(uint64_t addr, uint64_t len) const;

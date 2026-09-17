@@ -16,7 +16,7 @@ void die_on(sgError_t e, const char* what) {
 
 static void usage() {
     std::fprintf(stderr,
-                 "usage: sgbench [submit|batch|memcpy|vadd|gemm|mt|all]... [--quick] [--json FILE] "
+                 "usage: sgbench [submit|batch|memcpy|vadd|gemm|mt|alloc|all]... [--quick] [--json FILE] "
                  "[--tag NAME] [--threads N] [--repeat N]\n");
     std::exit(1);
 }
@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
 
     for (const auto& w : which)
         if (w != "all" && w != "submit" && w != "batch" && w != "memcpy" && w != "vadd" &&
-            w != "gemm" && w != "mt")
+            w != "gemm" && w != "mt" && w != "alloc")
             usage();
 
     bench::die_on(sgInit(), "sgInit");
@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
             if (all || w == "vadd") bench::bench_vadd(opt, rep);
             if (all || w == "gemm") bench::bench_gemm(opt, rep);
             if (all || w == "mt") bench::bench_mt(opt, rep);
+            if (all || w == "alloc") bench::bench_alloc(opt, rep);
         }
         if (opt.repeat > 1) std::fprintf(stderr, "pass %d/%d done\n", r + 1, opt.repeat);
     }

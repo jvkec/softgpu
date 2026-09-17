@@ -56,3 +56,7 @@ add_test(NAME runtime COMMAND sgtest)
 # Same tests with a 2-slot ring: every second submit hits backpressure.
 add_test(NAME runtime_ring2 COMMAND sgtest)
 set_tests_properties(runtime_ring2 PROPERTIES ENVIRONMENT "SG_RING_DEPTH=2")
+# Degenerate staging pool: one 64 KiB slot, so every pageable copy is many
+# chunks and every chunk waits on the previous one.
+add_test(NAME runtime_staging1 COMMAND sgtest)
+set_tests_properties(runtime_staging1 PROPERTIES ENVIRONMENT "SG_STAGING_SLOTS=1;SG_STAGING_CHUNK=65536")

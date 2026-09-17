@@ -23,12 +23,23 @@ std::optional<uint64_t> VramAllocator::alloc(uint64_t bytes) {
 }
 
 bool VramAllocator::free(uint64_t addr) {
+    uint64_t size = 0;
+    if (!detach(addr, &size)) return false;
+    release(addr, size);
+    return true;
+}
+
+bool VramAllocator::detach(uint64_t addr, uint64_t* size_out) {
     auto it = live_.find(addr);
     if (it == live_.end()) return false;
-    uint64_t start = addr, len = it->second;
+    *size_out = it->second;
     live_.erase(it);
-    live_bytes_ -= len;
+    live_bytes_ -= *size_out;
+    return true;
+}
 
+void VramAllocator::release(uint64_t addr, uint64_t len) {
+    uint64_t start = addr;
     // Coalesce with the following block, then with the preceding one.
     auto next = free_.lower_bound(start);
     if (next != free_.end() && next->first == start + len) {
@@ -44,7 +55,6 @@ bool VramAllocator::free(uint64_t addr) {
         }
     }
     free_.emplace(start, len);
-    return true;
 }
 
 bool VramAllocator::owns_range(uint64_t addr, uint64_t len) const {

@@ -7,8 +7,10 @@
 //   vadd    - a realistic tiny workload: copy in, compute, copy out
 //   gemm    - compute-bound work, to see when submission cost stops mattering
 //   mt      - scaling with concurrent submitters (the big lock)
+//   alloc   - sgMalloc/sgFree cost while work is in flight (deferred frees)
 
 #include <atomic>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -98,69 +100,137 @@ void bench_memcpy(const Options& o, Report& rep) {
         // Keep total traffic per case roughly constant so runs take similar time.
         const size_t budget = (o.quick ? 256u : 1024u) << 20;
         const int iters = std::max<int>(3, int(budget / bytes));
-        std::vector<uint8_t> host(bytes, 0x5a);
+        std::vector<uint8_t> pageable(bytes, 0x5a);
+        uint8_t* pinned = nullptr;
+        die_on(sgMallocHost(reinterpret_cast<void**>(&pinned), bytes), "sgMallocHost");
+        std::memset(pinned, 0x5a, bytes);
         sgDevPtr d = must_malloc(bytes);
 
-        for (int dir = 0; dir < 2; ++dir) {
-            auto op = [&] {
-                return dir == 0 ? sgMemcpyH2D(d, host.data(), bytes)
-                                : sgMemcpyD2H(host.data(), d, bytes);
-            };
-            op();
-            Window w;
-            w.begin();
-            for (int i = 0; i < iters; ++i) die_on(op(), "memcpy");
-            die_on(sgDeviceSynchronize(), "sync");
-            w.end();
-            char name[64];
-            std::snprintf(name, sizeof name, "%s_%zuKiB", dir == 0 ? "h2d" : "d2h", bytes >> 10);
-            Row r{"memcpy", name, {}};
-            r.metrics["GBps"] = double(bytes) * iters / w.wall_ns();
-            r.metrics["ns_per_op"] = w.wall_ns() / iters;
-            w.fill(r, iters);
-            rep.rows.push_back(r);
+        // Same synchronous API on pageable memory (staging pool) and pinned
+        // memory (direct DMA, waited on); the difference is the data path.
+        for (int mem = 0; mem < 2; ++mem) {
+            uint8_t* host = mem == 0 ? pageable.data() : pinned;
+            for (int dir = 0; dir < 2; ++dir) {
+                auto op = [&] {
+                    return dir == 0 ? sgMemcpyH2D(d, host, bytes) : sgMemcpyD2H(host, d, bytes);
+                };
+                op();
+                Window w;
+                w.begin();
+                for (int i = 0; i < iters; ++i) die_on(op(), "memcpy");
+                die_on(sgDeviceSynchronize(), "sync");
+                w.end();
+                char name[64];
+                std::snprintf(name, sizeof name, "%s%s_%zuKiB", dir == 0 ? "h2d" : "d2h",
+                              mem == 0 ? "" : "_pinned", bytes >> 10);
+                Row r{"memcpy", name, {}};
+                r.metrics["GBps"] = double(bytes) * iters / w.wall_ns();
+                r.metrics["ns_per_op"] = w.wall_ns() / iters;
+                w.fill(r, iters);
+                rep.rows.push_back(r);
+            }
         }
         sgFree(d);
+        sgFreeHost(pinned);
     }
 }
 
 void bench_vadd(const Options& o, Report& rep) {
     const uint32_t ns[] = {1u << 10, 1u << 16, 1u << 20, 1u << 24};
-    for (uint32_t n : ns) {
-        const size_t bytes = size_t(n) * 4;
-        const int iters = o.quick ? 3 : std::max<int>(5, int((256u << 20) / bytes));
-        std::vector<float> a(n, 1.0f), b(n, 2.0f), c(n);
-        sgDevPtr da = must_malloc(bytes), db = must_malloc(bytes), dc = must_malloc(bytes);
+    for (int mem = 0; mem < 2; ++mem) {
+        const bool pinned = mem == 1;
+        for (uint32_t n : ns) {
+            const size_t bytes = size_t(n) * 4;
+            const int iters = o.quick ? 3 : std::max<int>(5, int((256u << 20) / bytes));
+            std::vector<float> ha, hb, hc;
+            float *a, *b, *c;
+            if (pinned) {
+                die_on(sgMallocHost(reinterpret_cast<void**>(&a), bytes), "sgMallocHost");
+                die_on(sgMallocHost(reinterpret_cast<void**>(&b), bytes), "sgMallocHost");
+                die_on(sgMallocHost(reinterpret_cast<void**>(&c), bytes), "sgMallocHost");
+                std::fill(a, a + n, 1.0f);
+                std::fill(b, b + n, 2.0f);
+            } else {
+                ha.assign(n, 1.0f); hb.assign(n, 2.0f); hc.assign(n, 0.0f);
+                a = ha.data(); b = hb.data(); c = hc.data();
+            }
+            sgDevPtr da = must_malloc(bytes), db = must_malloc(bytes), dc = must_malloc(bytes);
 
-        double t_in = 0, t_k = 0, t_out = 0;
+            // Pageable: the synchronous API, as an application would write it.
+            // Pinned: async copies and one sync per iteration — the shape the
+            // pinned contract exists to enable.
+            double t_in = 0, t_k = 0, t_out = 0;
+            Window w;
+            w.begin();
+            for (int i = 0; i < iters; ++i) {
+                auto t0 = Clock::now();
+                if (pinned) {
+                    die_on(sgMemcpyH2DAsync(da, a, bytes, nullptr), "h2d");
+                    die_on(sgMemcpyH2DAsync(db, b, bytes, nullptr), "h2d");
+                } else {
+                    die_on(sgMemcpyH2D(da, a, bytes), "h2d");
+                    die_on(sgMemcpyH2D(db, b, bytes), "h2d");
+                }
+                auto t1 = Clock::now();
+                die_on(sgVaddF32(dc, da, db, n), "vadd");
+                auto t2 = Clock::now();
+                if (pinned) {
+                    die_on(sgMemcpyD2HAsync(c, dc, bytes, nullptr), "d2h");
+                    die_on(sgDeviceSynchronize(), "sync");
+                } else {
+                    die_on(sgMemcpyD2H(c, dc, bytes), "d2h");
+                }
+                auto t3 = Clock::now();
+                t_in += std::chrono::duration<double, std::nano>(t1 - t0).count();
+                t_k += std::chrono::duration<double, std::nano>(t2 - t1).count();
+                t_out += std::chrono::duration<double, std::nano>(t3 - t2).count();
+            }
+            die_on(sgDeviceSynchronize(), "sync");
+            w.end();
+            char name[32];
+            std::snprintf(name, sizeof name, "%sn=%u", pinned ? "pinned_" : "", n);
+            Row r{"vadd", name, {}};
+            r.metrics["us_per_iter"] = w.wall_ns() / iters / 1e3;
+            r.metrics["frac_h2d"] = t_in / (t_in + t_k + t_out);
+            r.metrics["frac_kernel"] = t_k / (t_in + t_k + t_out);
+            r.metrics["frac_d2h"] = t_out / (t_in + t_k + t_out);
+            w.fill(r, iters);
+            rep.rows.push_back(r);
+            sgFree(da); sgFree(db); sgFree(dc);
+            if (pinned) { sgFreeHost(a); sgFreeHost(b); sgFreeHost(c); }
+        }
+    }
+}
+
+void bench_alloc(const Options& o, Report& rep) {
+    // Cost of one sgMalloc+sgFree pair (a) with nothing in flight and (b)
+    // while a ~14 ms GEMM is executing. A driver that drains on free pays the
+    // whole GEMM in (b); a deferring one pays a list append.
+    const int rounds = o.quick ? 5 : 30;
+    const uint32_t d = 512;
+    const size_t gbytes = size_t(d) * d * 4;
+    sgDevPtr ga = must_malloc(gbytes), gb = must_malloc(gbytes), gc = must_malloc(gbytes);
+    die_on(sgMemset(ga, 0, gbytes), "memset");
+    die_on(sgMemset(gb, 0, gbytes), "memset");
+    for (int inflight = 0; inflight < 2; ++inflight) {
+        std::vector<double> lat;
         Window w;
         w.begin();
-        for (int i = 0; i < iters; ++i) {
+        for (int r = 0; r < rounds; ++r) {
+            if (inflight) die_on(sgGemmF32(gc, ga, gb, d, d, d), "gemm");
             auto t0 = Clock::now();
-            die_on(sgMemcpyH2D(da, a.data(), bytes), "h2d");
-            die_on(sgMemcpyH2D(db, b.data(), bytes), "h2d");
-            auto t1 = Clock::now();
-            die_on(sgVaddF32(dc, da, db, n), "vadd");
-            auto t2 = Clock::now();
-            die_on(sgMemcpyD2H(c.data(), dc, bytes), "d2h");
-            auto t3 = Clock::now();
-            t_in += std::chrono::duration<double, std::nano>(t1 - t0).count();
-            t_k += std::chrono::duration<double, std::nano>(t2 - t1).count();
-            t_out += std::chrono::duration<double, std::nano>(t3 - t2).count();
+            sgDevPtr p = must_malloc(4096);
+            die_on(sgFree(p), "free");
+            lat.push_back(ns_since(t0));
+            die_on(sgDeviceSynchronize(), "sync");
         }
-        die_on(sgDeviceSynchronize(), "sync");
         w.end();
-        char name[32];
-        std::snprintf(name, sizeof name, "n=%u", n);
-        Row r{"vadd", name, {}};
-        r.metrics["us_per_iter"] = w.wall_ns() / iters / 1e3;
-        r.metrics["frac_h2d"] = t_in / (t_in + t_k + t_out);
-        r.metrics["frac_kernel"] = t_k / (t_in + t_k + t_out);
-        r.metrics["frac_d2h"] = t_out / (t_in + t_k + t_out);
-        w.fill(r, iters);
+        Row r{"alloc", inflight ? "malloc_free_inflight" : "malloc_free_idle", {}};
+        latency_row(r, lat);
+        w.fill(r, rounds);
         rep.rows.push_back(r);
-        sgFree(da); sgFree(db); sgFree(dc);
     }
+    sgFree(ga); sgFree(gb); sgFree(gc);
 }
 
 void bench_gemm(const Options& o, Report& rep) {
