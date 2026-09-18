@@ -13,13 +13,23 @@
 extern "C" {
 #endif
 
+#define SG_MAX_ENGINES_RT 4 /* mirrors SG_MAX_ENGINES in the driver ABI */
+
 typedef uint64_t sgDevPtr; /* opaque device address (VRAM offset) */
 
 /*
- * Streams order work. Only the default stream (NULL) exists yet; the type is
- * declared now so the *Async signatures do not change when real streams land.
+ * Streams and events.
+ *
+ * Work submitted to one stream executes in submission order, even when it is
+ * spread across the device's engines (copies run on a copy engine, kernels on
+ * the compute engine). Work on different streams may overlap. The default
+ * stream (NULL) is an ordinary stream: it does NOT implicitly synchronize
+ * with other streams (CUDA's per-thread-default-stream semantics). Events
+ * record a point in a stream; sgStreamWaitEvent makes another stream wait
+ * for it on the device, without blocking the host.
  */
 typedef struct sgStream* sgStream_t;
+typedef struct sgEvent* sgEvent_t;
 
 typedef enum sgError {
     SG_OK = 0,
@@ -33,10 +43,13 @@ typedef enum sgError {
 } sgError_t;
 
 typedef struct sgStats {
-    uint64_t device_busy_cycles;
-    uint64_t device_idle_cycles;
-    uint64_t device_cmds_executed;
-    uint64_t device_batches;   /* times the device woke up and found work   */
+    uint32_t num_engines;      /* engine 0 = compute, 1.. = copy engines       */
+    uint32_t reserved;
+    uint64_t engine_busy_cycles[SG_MAX_ENGINES_RT];  /* executing              */
+    uint64_t engine_wait_cycles[SG_MAX_ENGINES_RT];  /* blocked on a semaphore */
+    uint64_t engine_idle_cycles[SG_MAX_ENGINES_RT];  /* nothing queued         */
+    uint64_t engine_cmds[SG_MAX_ENGINES_RT];
+    uint64_t engine_batches[SG_MAX_ENGINES_RT];      /* idle->busy wakes       */
     uint64_t driver_submits;
     uint64_t driver_waits;     /* times the host blocked waiting on the device */
     uint64_t driver_stalls;    /* times submission blocked on a full queue     */
@@ -66,29 +79,40 @@ sgError_t sgFreeHost(void* ptr);
 sgError_t sgHostRegister(void* ptr, size_t bytes);
 sgError_t sgHostUnregister(void* ptr);
 
+/* Streams and events. Destroying a stream or event does not wait for work. */
+sgError_t sgStreamCreate(sgStream_t* out);
+sgError_t sgStreamDestroy(sgStream_t stream);
+sgError_t sgStreamSynchronize(sgStream_t stream); /* host waits for this stream's work */
+sgError_t sgEventCreate(sgEvent_t* out);
+sgError_t sgEventDestroy(sgEvent_t event);
+sgError_t sgEventRecord(sgEvent_t event, sgStream_t stream);
+sgError_t sgEventSynchronize(sgEvent_t event);    /* host waits for the recorded point */
+sgError_t sgStreamWaitEvent(sgStream_t stream, sgEvent_t event); /* device-side wait */
+
 /*
- * Copies. The synchronous forms return when the host buffer may be reused
- * (H2D) or the data has arrived (D2H). The *Async forms return as soon as
- * the copy is queued when the host buffer is pinned — do not touch it until
- * sgDeviceSynchronize() — and behave like the synchronous forms for pageable
- * memory. `stream` must be NULL for now.
+ * Copies. The synchronous forms run on the default stream and return when
+ * the host buffer may be reused (H2D) or the data has arrived (D2H). The
+ * *Async forms return as soon as the copy is queued when the host buffer is
+ * pinned — do not touch it until the stream has synchronized — and behave
+ * like the synchronous forms for pageable memory.
  */
 sgError_t sgMemset(sgDevPtr dst, int value, size_t bytes);
 sgError_t sgMemcpyH2D(sgDevPtr dst, const void* src, size_t bytes);
 sgError_t sgMemcpyD2H(void* dst, sgDevPtr src, size_t bytes);
 sgError_t sgMemcpyD2D(sgDevPtr dst, sgDevPtr src, size_t bytes);
+sgError_t sgMemsetAsync(sgDevPtr dst, int value, size_t bytes, sgStream_t stream);
 sgError_t sgMemcpyH2DAsync(sgDevPtr dst, const void* src, size_t bytes, sgStream_t stream);
 sgError_t sgMemcpyD2HAsync(void* dst, sgDevPtr src, size_t bytes, sgStream_t stream);
+sgError_t sgMemcpyD2DAsync(sgDevPtr dst, sgDevPtr src, size_t bytes, sgStream_t stream);
 
-/* Compute. All operands are f32 in device memory. */
+/* Compute. All operands are f32 in device memory. Asynchronous. */
 sgError_t sgVaddF32(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t n);
 sgError_t sgGemmF32(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, uint32_t k);
+sgError_t sgVaddF32Async(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t n, sgStream_t stream);
+sgError_t sgGemmF32Async(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, uint32_t k,
+                         sgStream_t stream);
 
-/*
- * Wait for all submitted work to finish.
- * BASELINE: every call above is synchronous, so this is a no-op. It exists
- * so applications written today keep working once submission goes async.
- */
+/* Wait for all submitted work on every stream and engine to finish. */
 sgError_t sgDeviceSynchronize(void);
 
 /* Telemetry. */

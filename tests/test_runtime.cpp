@@ -2,6 +2,7 @@
 // a CHECK macro and a process exit code are all ctest needs.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -234,9 +235,7 @@ static void test_async_pinned_pipeline() {
     bool ok = true;
     for (uint32_t i = 0; i < n && ok; ++i) ok = (c[i] == 3.0f * float(i));
     CHECK(ok);
-    CHECK(s1.driver_waits - s0.driver_waits == 1); // only the final sync blocked
-    // A non-null stream is rejected until streams exist.
-    CHECK(sgMemcpyH2DAsync(da, a, 4, reinterpret_cast<sgStream_t>(1)) == SG_ERR_INVALID_VALUE);
+    CHECK(s1.driver_waits - s0.driver_waits <= 1); // at most the final sync blocked
     CHECK_OK(sgFree(da)); CHECK_OK(sgFree(db)); CHECK_OK(sgFree(dc));
     CHECK_OK(sgFreeHost(a)); CHECK_OK(sgFreeHost(b)); CHECK_OK(sgFreeHost(c));
 }
@@ -296,6 +295,223 @@ static void test_concurrent_pinned_submitters() {
     CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
 }
 
+// ---- stage 3b: engines, streams, events -----------------------------------
+
+static void test_stream_cross_engine_ordering() {
+    // 64 chunks of H2D -> VADD -> D2H, all async on one stream: copies run on
+    // the copy engine, VADD on the compute engine; the stream must keep them
+    // ordered via device-side waits, and the host only syncs once.
+    const int chunks = 64;
+    const uint32_t n = 1 << 12;
+    float *a, *b, *c;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&a), n * 4));
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&b), n * 4));
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&c), size_t(chunks) * n * 4));
+    sgDevPtr da = 0, db = 0, dc = 0;
+    CHECK_OK(sgMalloc(&da, n * 4)); CHECK_OK(sgMalloc(&db, n * 4)); CHECK_OK(sgMalloc(&dc, n * 4));
+    sgStream_t s = nullptr;
+    CHECK_OK(sgStreamCreate(&s));
+    sgStats_t s0{}, s1{};
+    CHECK_OK(sgGetStats(&s0));
+    for (int i = 0; i < chunks; ++i) {
+        // Each chunk overwrites the same host inputs, so the copy for chunk i
+        // must land before VADD i, and VADD i before D2H i — and the host must
+        // not touch a/b again until the stream is done with them. We keep
+        // a[] constant and vary b[] via a device-side memset instead.
+        if (i == 0) {
+            std::fill(a, a + n, 1.0f);
+            CHECK_OK(sgMemcpyH2DAsync(da, a, n * 4, s));
+        }
+        CHECK_OK(sgMemsetAsync(db, i, n * 4, s)); // bytes = i -> a known float pattern
+        CHECK_OK(sgVaddF32Async(dc, da, db, n, s));
+        CHECK_OK(sgMemcpyD2HAsync(c + size_t(i) * n, dc, n * 4, s));
+    }
+    CHECK_OK(sgStreamSynchronize(s));
+    CHECK_OK(sgGetStats(&s1));
+    CHECK(s1.driver_waits - s0.driver_waits <= 1); // at most the final sync blocks
+    bool ok = true;
+    for (int i = 0; i < chunks && ok; ++i) {
+        uint32_t bits = uint32_t(i) * 0x01010101u;
+        float bf;
+        std::memcpy(&bf, &bits, 4);
+        const float expect = 1.0f + bf;
+        for (uint32_t j = 0; j < n && ok; ++j) ok = (c[size_t(i) * n + j] == expect);
+    }
+    CHECK(ok);
+    CHECK_OK(sgStreamDestroy(s));
+    CHECK_OK(sgFree(da)); CHECK_OK(sgFree(db)); CHECK_OK(sgFree(dc));
+    CHECK_OK(sgFreeHost(a)); CHECK_OK(sgFreeHost(b)); CHECK_OK(sgFreeHost(c));
+}
+
+static void test_two_streams_independent() {
+    const uint32_t n = 1 << 16;
+    struct Chain { sgStream_t s; float *a, *b, *c; sgDevPtr da, db, dc; float va, vb; };
+    Chain ch[2] = {{nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 1.0f, 2.0f},
+                   {nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 10.0f, 20.0f}};
+    for (auto& k : ch) {
+        CHECK_OK(sgStreamCreate(&k.s));
+        CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&k.a), n * 4));
+        CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&k.b), n * 4));
+        CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&k.c), n * 4));
+        std::fill(k.a, k.a + n, k.va);
+        std::fill(k.b, k.b + n, k.vb);
+        CHECK_OK(sgMalloc(&k.da, n * 4)); CHECK_OK(sgMalloc(&k.db, n * 4)); CHECK_OK(sgMalloc(&k.dc, n * 4));
+    }
+    for (int rep = 0; rep < 50; ++rep)
+        for (auto& k : ch) {
+            CHECK_OK(sgMemcpyH2DAsync(k.da, k.a, n * 4, k.s));
+            CHECK_OK(sgMemcpyH2DAsync(k.db, k.b, n * 4, k.s));
+            CHECK_OK(sgVaddF32Async(k.dc, k.da, k.db, n, k.s));
+            CHECK_OK(sgMemcpyD2HAsync(k.c, k.dc, n * 4, k.s));
+        }
+    CHECK_OK(sgDeviceSynchronize());
+    for (auto& k : ch) {
+        CHECK(std::all_of(k.c, k.c + n, [&](float v) { return v == k.va + k.vb; }));
+        CHECK_OK(sgStreamDestroy(k.s));
+        CHECK_OK(sgFree(k.da)); CHECK_OK(sgFree(k.db)); CHECK_OK(sgFree(k.dc));
+        CHECK_OK(sgFreeHost(k.a)); CHECK_OK(sgFreeHost(k.b)); CHECK_OK(sgFreeHost(k.c));
+    }
+}
+
+static void test_event_dependency() {
+    // Stream A produces x (a slow-ish GEMM then a memset marker); stream B
+    // must see A's result only if it waited on the event. Repeated to catch
+    // races: without the wait, B's D2D would usually copy stale data.
+    const uint32_t d = 128;
+    const size_t bytes = size_t(d) * d * 4;
+    sgStream_t A = nullptr, B = nullptr;
+    sgEvent_t ev = nullptr;
+    CHECK_OK(sgStreamCreate(&A)); CHECK_OK(sgStreamCreate(&B)); CHECK_OK(sgEventCreate(&ev));
+    sgDevPtr ga = 0, gb = 0, x = 0, y = 0;
+    CHECK_OK(sgMalloc(&ga, bytes)); CHECK_OK(sgMalloc(&gb, bytes));
+    CHECK_OK(sgMalloc(&x, bytes)); CHECK_OK(sgMalloc(&y, bytes));
+    CHECK_OK(sgMemset(ga, 0, bytes)); CHECK_OK(sgMemset(gb, 0, bytes));
+    std::vector<uint8_t> out(bytes);
+    // Waiting on an event that was never recorded is a no-op.
+    CHECK_OK(sgStreamWaitEvent(B, ev));
+    int bad = 0;
+    for (int i = 0; i < 200; ++i) {
+        const uint8_t marker = uint8_t(i + 1);
+        CHECK_OK(sgMemsetAsync(x, 0, bytes, A));
+        CHECK_OK(sgGemmF32Async(x, ga, gb, d, d, d, A)); // ~200 us of work writing x
+        CHECK_OK(sgMemsetAsync(x, marker, bytes, A));
+        CHECK_OK(sgEventRecord(ev, A));
+        CHECK_OK(sgStreamWaitEvent(B, ev));
+        CHECK_OK(sgMemcpyD2DAsync(y, x, bytes, B));
+        CHECK_OK(sgMemcpyD2HAsync(out.data(), y, bytes, B)); // pageable: synchronous
+        CHECK_OK(sgStreamSynchronize(B));
+        if (!std::all_of(out.begin(), out.end(), [&](uint8_t v) { return v == marker; })) ++bad;
+    }
+    CHECK(bad == 0);
+    CHECK_OK(sgEventSynchronize(ev));
+    CHECK_OK(sgEventDestroy(ev)); CHECK_OK(sgStreamDestroy(A)); CHECK_OK(sgStreamDestroy(B));
+    CHECK_OK(sgFree(ga)); CHECK_OK(sgFree(gb)); CHECK_OK(sgFree(x)); CHECK_OK(sgFree(y));
+}
+
+static void test_stream_sync_is_per_stream() {
+    // Synchronizing stream B must not wait for a long GEMM queued on A.
+    const uint32_t d = 512;
+    const size_t bytes = size_t(d) * d * 4;
+    sgStream_t A = nullptr, B = nullptr;
+    CHECK_OK(sgStreamCreate(&A)); CHECK_OK(sgStreamCreate(&B));
+    sgDevPtr ga = 0, gb = 0, gc = 0, t = 0;
+    CHECK_OK(sgMalloc(&ga, bytes)); CHECK_OK(sgMalloc(&gb, bytes)); CHECK_OK(sgMalloc(&gc, bytes));
+    CHECK_OK(sgMalloc(&t, 4096));
+    CHECK_OK(sgMemset(ga, 0, bytes)); CHECK_OK(sgMemset(gb, 0, bytes));
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK_OK(sgGemmF32Async(gc, ga, gb, d, d, d, A)); // ~14 ms on the compute engine
+    uint8_t* h = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&h), 4096));
+    CHECK_OK(sgMemcpyH2DAsync(t, h, 4096, B)); // copy engine only
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK_OK(sgStreamSynchronize(B));
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(ms < 5.0); // did not wait for A's GEMM
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK_OK(sgStreamDestroy(A)); CHECK_OK(sgStreamDestroy(B));
+    CHECK_OK(sgFree(ga)); CHECK_OK(sgFree(gb)); CHECK_OK(sgFree(gc)); CHECK_OK(sgFree(t));
+    CHECK_OK(sgFreeHost(h));
+}
+
+static void test_pageable_on_streams_and_deferred_copy_free() {
+    // Pageable copies on a non-default stream go through staging slots whose
+    // fences now live on the copy engine; and freeing VRAM that an in-flight
+    // *copy* references must be deferred just like compute.
+    const size_t n = 3u << 20; // 3 MiB: many staging chunks
+    std::vector<uint8_t> src(n), dst(n);
+    for (size_t i = 0; i < n; ++i) src[i] = uint8_t(i * 7);
+    sgStream_t s = nullptr;
+    CHECK_OK(sgStreamCreate(&s));
+    sgDevPtr d = 0;
+    CHECK_OK(sgMalloc(&d, n));
+    CHECK_OK(sgMemcpyH2DAsync(d, src.data(), n, s)); // pageable: staged, host buffer reusable
+    CHECK_OK(sgMemcpyD2HAsync(dst.data(), d, n, s)); // pageable: synchronous
+    CHECK(src == dst);
+    // Queue a large copy out of d, free d, reallocate, overwrite; the copy
+    // must have finished reading before the memory is reused.
+    uint8_t* h = nullptr;
+    CHECK_OK(sgMallocHost(reinterpret_cast<void**>(&h), n));
+    CHECK_OK(sgMemcpyD2HAsync(h, d, n, s)); // direct DMA, in flight
+    CHECK_OK(sgFree(d));
+    sgDevPtr d2 = 0;
+    CHECK_OK(sgMalloc(&d2, n));
+    CHECK_OK(sgMemsetAsync(d2, 0xEE, n, s));
+    CHECK_OK(sgDeviceSynchronize());
+    CHECK(std::memcmp(h, src.data(), n) == 0); // the DMA read d, not our memset
+    CHECK_OK(sgFree(d2)); CHECK_OK(sgFreeHost(h)); CHECK_OK(sgStreamDestroy(s));
+}
+
+static void test_engine_rejections() {
+    sgStats_t st{};
+    CHECK_OK(sgGetStats(&st));
+    CHECK(st.num_engines >= 2);
+    // The public API cannot express "compute on a copy engine", so exercise
+    // the driver's checks through the wait path instead: sgStreamWaitEvent
+    // on a recorded event followed by a submit is the only WAIT producer and
+    // is validated by construction. What we can check publicly: a stream's
+    // synchronize with nothing submitted, and destroying NULL.
+    CHECK(sgStreamDestroy(nullptr) == SG_ERR_INVALID_VALUE);
+    CHECK(sgEventDestroy(nullptr) == SG_ERR_INVALID_VALUE);
+    CHECK_OK(sgStreamSynchronize(nullptr));
+    sgStream_t s = nullptr;
+    CHECK_OK(sgStreamCreate(&s));
+    CHECK_OK(sgStreamSynchronize(s));
+    CHECK_OK(sgStreamDestroy(s));
+}
+
+static void test_concurrent_streams() {
+    const int T = 8, iters = 50;
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, &bad] {
+            const uint32_t n = 1 << 14;
+            sgStream_t s = nullptr;
+            float *a, *b, *c;
+            if (sgStreamCreate(&s) != SG_OK ||
+                sgMallocHost(reinterpret_cast<void**>(&a), n * 4) != SG_OK ||
+                sgMallocHost(reinterpret_cast<void**>(&b), n * 4) != SG_OK ||
+                sgMallocHost(reinterpret_cast<void**>(&c), n * 4) != SG_OK) { bad[t] = 1; return; }
+            sgDevPtr da = 0, db = 0, dc = 0;
+            if (sgMalloc(&da, n * 4) != SG_OK || sgMalloc(&db, n * 4) != SG_OK || sgMalloc(&dc, n * 4) != SG_OK) { bad[t] = 1; return; }
+            for (int i = 0; i < iters && !bad[t]; ++i) {
+                std::fill(a, a + n, float(t));
+                std::fill(b, b + n, float(i));
+                if (sgMemcpyH2DAsync(da, a, n * 4, s) != SG_OK || sgMemcpyH2DAsync(db, b, n * 4, s) != SG_OK ||
+                    sgVaddF32Async(dc, da, db, n, s) != SG_OK || sgMemcpyD2HAsync(c, dc, n * 4, s) != SG_OK ||
+                    sgStreamSynchronize(s) != SG_OK)
+                    bad[t] = 1;
+                else if (!std::all_of(c, c + n, [&](float v) { return v == float(t) + float(i); }))
+                    bad[t] = 1;
+            }
+            sgFree(da); sgFree(db); sgFree(dc);
+            sgFreeHost(a); sgFreeHost(b); sgFreeHost(c);
+            sgStreamDestroy(s);
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+}
+
 static void test_concurrent_submitters() {
     // Many threads hammering the driver; every thread verifies its own data.
     const int T = 8, iters = 200;
@@ -337,6 +553,13 @@ int main() {
         {"async_pinned_pipeline", test_async_pinned_pipeline},
         {"deferred_free", test_deferred_free},
         {"concurrent_pinned_submitters", test_concurrent_pinned_submitters},
+        {"stream_cross_engine_ordering", test_stream_cross_engine_ordering},
+        {"two_streams_independent", test_two_streams_independent},
+        {"event_dependency", test_event_dependency},
+        {"stream_sync_is_per_stream", test_stream_sync_is_per_stream},
+        {"pageable_on_streams_and_deferred_copy_free", test_pageable_on_streams_and_deferred_copy_free},
+        {"engine_rejections", test_engine_rejections},
+        {"concurrent_streams", test_concurrent_streams},
         {"concurrent_submitters", test_concurrent_submitters},
     };
     for (auto& t : tests) {

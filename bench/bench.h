@@ -98,10 +98,19 @@ struct Window {
     }
     double wall_ns() const { return std::chrono::duration<double, std::nano>(t1 - t0).count(); }
     double cpu_ns() const { return cpu_override >= 0 ? cpu_override : cpu1 - cpu0; }
-    double dev_busy() const { return double(s1.device_busy_cycles - s0.device_busy_cycles); }
-    double dev_idle() const { return double(s1.device_idle_cycles - s0.device_idle_cycles); }
-    double dev_cmds() const { return double(s1.device_cmds_executed - s0.device_cmds_executed); }
-    double dev_batches() const { return double(s1.device_batches - s0.device_batches); }
+    // Per-engine deltas. Engine 0 is the compute engine; the "device" figures
+    // used by the older benchmarks refer to it.
+    double busy(uint32_t e) const { return double(s1.engine_busy_cycles[e] - s0.engine_busy_cycles[e]); }
+    double waitc(uint32_t e) const { return double(s1.engine_wait_cycles[e] - s0.engine_wait_cycles[e]); }
+    double idle(uint32_t e) const { return double(s1.engine_idle_cycles[e] - s0.engine_idle_cycles[e]); }
+    double cmds(uint32_t e) const { return double(s1.engine_cmds[e] - s0.engine_cmds[e]); }
+    double batches(uint32_t e) const { return double(s1.engine_batches[e] - s0.engine_batches[e]); }
+    double util(uint32_t e) const { return busy(e) / std::max(1.0, busy(e) + waitc(e) + idle(e)); }
+    uint32_t engines() const { return s1.num_engines; }
+    double dev_busy() const { return busy(0); }
+    double dev_idle() const { return idle(0) + waitc(0); }
+    double dev_cmds() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += cmds(e); return n; }
+    double dev_batches() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += batches(e); return n; }
     double waits() const { return double(s1.driver_waits - s0.driver_waits); }
     double stalls() const { return double(s1.driver_stalls - s0.driver_stalls); }
     double staging_waits() const { return double(s1.staging_waits - s0.staging_waits); }
@@ -112,7 +121,23 @@ struct Window {
     void fill(Row& r, double ops) const {
         r.metrics["wall_ms"] = wall_ns() / 1e6;
         r.metrics["cpu_ns_per_op"] = cpu_ns() / ops;
-        r.metrics["dev_util"] = dev_busy() / std::max(1.0, dev_busy() + dev_idle());
+        r.metrics["dev_util"] = util(0); // compute engine
+        // Copy engines: utilization of the busiest one, and the fraction of
+        // its non-idle time spent blocked on a semaphore rather than copying.
+        double ce_util = 0, ce_busy = 0, ce_wait = 0;
+        for (uint32_t e = 1; e < engines(); ++e) {
+            ce_util = std::max(ce_util, util(e));
+            ce_busy += busy(e);
+            ce_wait += waitc(e);
+        }
+        if (engines() > 1) {
+            r.metrics["ce_util"] = ce_util;
+            r.metrics["ce_wait_frac"] = ce_wait / std::max(1.0, ce_busy + ce_wait);
+        }
+        // Average number of engines executing at once (> 1 means overlap).
+        double all_busy = 0;
+        for (uint32_t e = 0; e < engines(); ++e) all_busy += busy(e);
+        r.metrics["concurrency"] = all_busy / std::max(1.0, wall_ns());
         r.metrics["dev_cmds_per_op"] = dev_cmds() / ops;
         r.metrics["waits_per_op"] = waits() / ops;
         r.metrics["stalls_per_op"] = stalls() / ops;
@@ -140,5 +165,6 @@ void bench_vadd(const Options&, Report&);
 void bench_gemm(const Options&, Report&);
 void bench_mt(const Options&, Report&);
 void bench_alloc(const Options&, Report&);
+void bench_pipeline(const Options&, Report&);
 
 } // namespace bench

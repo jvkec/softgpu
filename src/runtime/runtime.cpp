@@ -1,7 +1,17 @@
 // User-mode runtime: implements sg_runtime.h on top of the driver's
-// ioctl-shaped interface. It owns no device state — only a descriptor — and
-// never touches VRAM or registers. Its jobs are argument marshalling and
-// mapping -errno to sgError_t.
+// ioctl-shaped interface. It owns no device state — only a descriptor plus
+// the stream and event objects — and never touches VRAM or registers.
+//
+// STAGE 3b: streams. The device has a compute engine and copy engines, each
+// serving several channels (in-order rings). A stream owns one channel index
+// and keeps its commands in order *across* engines: before submitting to
+// engine E, if the stream's previous command ran on E' != E, it first
+// submits a SG_OP_WAIT_FENCE on (E, channel) for that command's fence. Waiting on the immediate
+// predecessor is enough because rings are in order and the predecessor
+// already waited on its own predecessor. Events are (engine, fence)
+// snapshots; sgStreamWaitEvent turns them into extra WAITs ahead of the
+// stream's next command. This is how CUDA streams sit on top of channels and
+// semaphores.
 
 #include "softgpu/sg_runtime.h"
 
@@ -9,22 +19,43 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 #include "driver/sg_driver.h"
 #include "softgpu/sg_ioctl.h"
 
+struct sgFence {
+    uint32_t engine = 0;
+    uint32_t channel = 0;
+    uint64_t value = 0;
+};
+
+struct sgStream {
+    std::mutex m;
+    uint32_t id = 0;
+    uint32_t ce = 1;        // copy engine this stream's copies go to
+    uint32_t channel = 0;   // ring index used on every engine
+    bool has_tail = false;  // has any command been submitted?
+    sgFence tail;           // the most recent command
+    std::vector<sgFence> extra_waits; // from sgStreamWaitEvent
+};
+
+struct sgEvent {
+    std::mutex m;
+    bool recorded = false;
+    sgFence at;
+};
+
 namespace {
 
 int g_fd = -1;
-// Highest fence handed out so far. Submitters race to publish theirs after
-// the ioctl returns, so keep the max rather than the last writer's value;
-// sgDeviceSynchronize() then means "everything any thread has submitted".
-std::atomic<uint64_t> g_last_fence{0};
-
-void publish_fence(uint64_t f) {
-    uint64_t cur = g_last_fence.load(std::memory_order_relaxed);
-    while (cur < f && !g_last_fence.compare_exchange_weak(cur, f, std::memory_order_relaxed)) {}
-}
+uint32_t g_num_engines = 1;
+uint32_t g_num_ce = 0;
+uint32_t g_num_channels = 1;
+std::atomic<uint32_t> g_next_stream_id{1};
+sgStream g_default_stream; // NULL maps here; id 0
 
 sgError_t from_errno(int rc) {
     switch (rc) {
@@ -39,43 +70,83 @@ sgError_t from_errno(int rc) {
     }
 }
 
-sgError_t wait_fence(uint64_t fence) {
-    sg_wait_args w{fence};
+sgError_t wait_fence(const sgFence& f) {
+    sg_wait_args w{f.engine, f.channel, f.value};
     return from_errno(sg_drv_ioctl(g_fd, SG_IOC_WAIT, &w));
 }
 
-// Submit one command. `direct` (optional) reports whether the driver DMA'd
-// straight to/from the user buffer, in which case `fence` is the caller's
-// only way to know when that buffer is free again.
-sgError_t submit(sg_cmd cmd, uint64_t host_ptr = 0, uint64_t* fence = nullptr,
-                 bool* direct = nullptr) {
-    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
-    sg_submit_args a{};
-    a.cmd = cmd;
-    a.host_ptr = host_ptr;
-    int rc = sg_drv_ioctl(g_fd, SG_IOC_SUBMIT, &a);
-    if (rc == 0) {
-        publish_fence(a.fence);
-        if (fence) *fence = a.fence;
-        if (direct) *direct = (a.out_flags & SG_SUBMIT_DIRECT) != 0;
-    }
-    return from_errno(rc);
-}
-
-// Synchronous copy contract: if the driver went direct, the user buffer is
-// still being read/written by the device until the fence retires.
-sgError_t submit_copy_sync(sg_cmd cmd, uint64_t host_ptr) {
-    uint64_t fence = 0;
-    bool direct = false;
-    sgError_t e = submit(cmd, host_ptr, &fence, &direct);
-    if (e != SG_OK || !direct) return e;
-    return wait_fence(fence);
+// Everything submitted so far by any thread, on every engine and channel.
+sgError_t wait_all() {
+    sg_wait_args w{SG_WAIT_ALL, 0, 0};
+    return from_errno(sg_drv_ioctl(g_fd, SG_IOC_WAIT, &w));
 }
 
 sg_cmd make_cmd(sg_opcode op) {
     sg_cmd c{};
     c.opcode = op;
     return c;
+}
+
+sgStream* resolve(sgStream_t s) { return s ? s : &g_default_stream; }
+
+// Raw submit of one command on one (engine, channel). `direct` (optional)
+// reports whether the driver DMA'd straight to/from the user buffer.
+int raw_submit(uint32_t engine, uint32_t channel, const sg_cmd& cmd, uint64_t host_ptr,
+               uint64_t* fence, bool* direct) {
+    sg_submit_args a{};
+    a.cmd = cmd;
+    a.host_ptr = host_ptr;
+    a.engine = engine;
+    a.channel = channel;
+    int rc = sg_drv_ioctl(g_fd, SG_IOC_SUBMIT, &a);
+    if (rc == 0) {
+        if (fence) *fence = a.fence;
+        if (direct) *direct = (a.out_flags & SG_SUBMIT_DIRECT) != 0;
+    }
+    return rc;
+}
+
+// Submit on a stream: flush the stream's pending cross-engine dependencies
+// as WAIT_FENCE commands on `engine`, then the command itself. Holding the
+// stream mutex across the ioctls makes the recorded order the submission
+// order.
+sgError_t stream_submit(sgStream* s, uint32_t engine, sg_cmd cmd, uint64_t host_ptr = 0,
+                        uint64_t* fence_out = nullptr, bool* direct = nullptr) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    std::lock_guard<std::mutex> g(s->m);
+
+    auto wait_on = [&](const sgFence& f) -> int {
+        if (f.engine == engine && f.channel == s->channel) return 0; // same ring, already ordered
+        sg_cmd w = make_cmd(SG_OP_WAIT_FENCE);
+        w.arg0 = f.engine;
+        w.arg1 = f.channel;
+        w.src1 = f.value;
+        return raw_submit(engine, s->channel, w, 0, nullptr, nullptr);
+    };
+    for (auto& f : s->extra_waits)
+        if (int rc = wait_on(f)) return from_errno(rc);
+    s->extra_waits.clear();
+    if (s->has_tail)
+        if (int rc = wait_on(s->tail)) return from_errno(rc);
+
+    uint64_t fence = 0;
+    int rc = raw_submit(engine, s->channel, cmd, host_ptr, &fence, direct);
+    if (rc == 0) {
+        s->has_tail = true;
+        s->tail = {engine, s->channel, fence};
+        if (fence_out) *fence_out = fence;
+    }
+    return from_errno(rc);
+}
+
+// Synchronous copy contract: if the driver went direct, the user buffer is
+// still being read/written by the device until the fence retires.
+sgError_t copy_sync(sgStream* s, sg_cmd cmd, uint64_t host_ptr) {
+    uint64_t fence = 0;
+    bool direct = false;
+    sgError_t e = stream_submit(s, s->ce, cmd, host_ptr, &fence, &direct);
+    if (e != SG_OK || !direct) return e;
+    return wait_fence({s->ce, s->channel, fence});
 }
 
 } // namespace
@@ -92,7 +163,16 @@ sgError_t sgInit(void) {
         return rc ? from_errno(rc) : SG_ERR_DEVICE;
     }
     g_fd = fd;
-    g_last_fence.store(0, std::memory_order_relaxed);
+    g_num_engines = q.num_engines;
+    g_num_ce = q.num_engines - 1;
+    g_num_channels = q.num_channels;
+    {
+        std::lock_guard<std::mutex> g(g_default_stream.m);
+        g_default_stream.has_tail = false;
+        g_default_stream.extra_waits.clear();
+        g_default_stream.ce = g_num_ce ? 1 : 0;
+        g_default_stream.channel = 0;
+    }
     return SG_OK;
 }
 
@@ -119,14 +199,6 @@ sgError_t sgFree(sgDevPtr ptr) {
     return from_errno(sg_drv_ioctl(g_fd, SG_IOC_FREE, &a));
 }
 
-sgError_t sgMemset(sgDevPtr dst, int value, size_t bytes) {
-    sg_cmd c = make_cmd(SG_OP_FILL);
-    c.dst = dst;
-    c.size = bytes;
-    c.value = static_cast<uint32_t>(value) & 0xffu;
-    return submit(c);
-}
-
 sgError_t sgMallocHost(void** out, size_t bytes) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     if (!out || bytes == 0) return SG_ERR_INVALID_VALUE;
@@ -134,7 +206,9 @@ sgError_t sgMallocHost(void** out, size_t bytes) {
     const size_t rounded = (bytes + page - 1) / page * page;
     void* p = nullptr;
     if (posix_memalign(&p, page, rounded) != 0) return SG_ERR_OUT_OF_MEMORY;
-    sg_pin_args a{reinterpret_cast<uint64_t>(p), rounded, 0};
+    sg_pin_args a{};
+    a.addr = reinterpret_cast<uint64_t>(p);
+    a.size = rounded;
     int rc = sg_drv_ioctl(g_fd, SG_IOC_PIN, &a);
     if (rc != 0) {
         std::free(p);
@@ -147,12 +221,13 @@ sgError_t sgMallocHost(void** out, size_t bytes) {
 sgError_t sgFreeHost(void* ptr) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     if (!ptr) return SG_ERR_INVALID_VALUE;
-    sg_pin_args a{reinterpret_cast<uint64_t>(ptr), 0, 0};
+    sg_pin_args a{};
+    a.addr = reinterpret_cast<uint64_t>(ptr);
     int rc = sg_drv_ioctl(g_fd, SG_IOC_UNPIN, &a);
     if (rc != 0) return from_errno(rc);
     // The device may still be DMAing to/from this memory; like cudaFreeHost,
-    // wait for that (and only that) before returning it to the allocator.
-    sgError_t e = wait_fence(a.fence);
+    // wait for everything queued so far before returning it to the allocator.
+    sgError_t e = wait_all();
     std::free(ptr);
     return e;
 }
@@ -160,17 +235,131 @@ sgError_t sgFreeHost(void* ptr) {
 sgError_t sgHostRegister(void* ptr, size_t bytes) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     if (!ptr || bytes == 0) return SG_ERR_INVALID_VALUE;
-    sg_pin_args a{reinterpret_cast<uint64_t>(ptr), bytes, 0};
+    sg_pin_args a{};
+    a.addr = reinterpret_cast<uint64_t>(ptr);
+    a.size = bytes;
     return from_errno(sg_drv_ioctl(g_fd, SG_IOC_PIN, &a));
 }
 
 sgError_t sgHostUnregister(void* ptr) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     if (!ptr) return SG_ERR_INVALID_VALUE;
-    sg_pin_args a{reinterpret_cast<uint64_t>(ptr), 0, 0};
+    sg_pin_args a{};
+    a.addr = reinterpret_cast<uint64_t>(ptr);
     // The memory stays valid (the caller owns it), so no need to wait for
     // in-flight DMAs here; the driver defers the unpin itself.
     return from_errno(sg_drv_ioctl(g_fd, SG_IOC_UNPIN, &a));
+}
+
+// ---- streams and events ------------------------------------------------
+
+sgError_t sgStreamCreate(sgStream_t* out) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!out) return SG_ERR_INVALID_VALUE;
+    auto* s = new sgStream();
+    s->id = g_next_stream_id.fetch_add(1, std::memory_order_relaxed);
+    // Spread streams across copy engines so independent streams' copies can
+    // overlap each other as well as compute, and across channels so one
+    // stream's semaphore wait does not block another's commands.
+    s->ce = g_num_ce ? 1 + (s->id % g_num_ce) : 0;
+    s->channel = s->id % g_num_channels;
+    *out = s;
+    return SG_OK;
+}
+
+sgError_t sgStreamDestroy(sgStream_t stream) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!stream) return SG_ERR_INVALID_VALUE;
+    delete stream; // in-flight commands do not reference the object
+    return SG_OK;
+}
+
+sgError_t sgStreamSynchronize(sgStream_t stream) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    sgStream* s = resolve(stream);
+    sgFence f;
+    {
+        std::lock_guard<std::mutex> g(s->m);
+        if (!s->has_tail) return SG_OK;
+        f = s->tail;
+    }
+    return wait_fence(f);
+}
+
+sgError_t sgEventCreate(sgEvent_t* out) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!out) return SG_ERR_INVALID_VALUE;
+    *out = new sgEvent();
+    return SG_OK;
+}
+
+sgError_t sgEventDestroy(sgEvent_t event) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!event) return SG_ERR_INVALID_VALUE;
+    delete event;
+    return SG_OK;
+}
+
+sgError_t sgEventRecord(sgEvent_t event, sgStream_t stream) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!event) return SG_ERR_INVALID_VALUE;
+    sgStream* s = resolve(stream);
+    // Recording is itself a command in the stream (a NOP), so it flushes any
+    // pending cross-stream waits and the event captures everything before it.
+    uint32_t engine, channel;
+    {
+        std::lock_guard<std::mutex> g(s->m);
+        engine = s->has_tail ? s->tail.engine : SG_ENGINE_COMPUTE;
+        channel = s->channel;
+    }
+    uint64_t fence = 0;
+    sgError_t e = stream_submit(s, engine, make_cmd(SG_OP_NOP), 0, &fence);
+    if (e != SG_OK) return e;
+    std::lock_guard<std::mutex> g(event->m);
+    event->recorded = true;
+    event->at = {engine, channel, fence};
+    return SG_OK;
+}
+
+sgError_t sgEventSynchronize(sgEvent_t event) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!event) return SG_ERR_INVALID_VALUE;
+    sgFence f;
+    {
+        std::lock_guard<std::mutex> g(event->m);
+        if (!event->recorded) return SG_OK;
+        f = event->at;
+    }
+    return wait_fence(f);
+}
+
+sgError_t sgStreamWaitEvent(sgStream_t stream, sgEvent_t event) {
+    if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
+    if (!event) return SG_ERR_INVALID_VALUE;
+    sgStream* s = resolve(stream);
+    sgFence f;
+    {
+        std::lock_guard<std::mutex> g(event->m);
+        if (!event->recorded) return SG_OK; // nothing to wait for
+        f = event->at;
+    }
+    std::lock_guard<std::mutex> g(s->m);
+    s->extra_waits.push_back(f);
+    return SG_OK;
+}
+
+// ---- copies --------------------------------------------------------------
+
+sgError_t sgMemsetAsync(sgDevPtr dst, int value, size_t bytes, sgStream_t stream) {
+    sg_cmd c = make_cmd(SG_OP_FILL);
+    c.dst = dst;
+    c.size = bytes;
+    c.value = static_cast<uint32_t>(value) & 0xffu;
+    return stream_submit(resolve(stream), SG_ENGINE_COMPUTE, c);
+}
+
+sgError_t sgMemset(sgDevPtr dst, int value, size_t bytes) {
+    return sgMemsetAsync(dst, value, bytes, nullptr);
 }
 
 sgError_t sgMemcpyH2D(sgDevPtr dst, const void* src, size_t bytes) {
@@ -178,7 +367,7 @@ sgError_t sgMemcpyH2D(sgDevPtr dst, const void* src, size_t bytes) {
     sg_cmd c = make_cmd(SG_OP_COPY_H2D);
     c.dst = dst;
     c.size = bytes;
-    return submit_copy_sync(c, reinterpret_cast<uint64_t>(src));
+    return copy_sync(&g_default_stream, c, reinterpret_cast<uint64_t>(src));
 }
 
 sgError_t sgMemcpyD2H(void* dst, sgDevPtr src, size_t bytes) {
@@ -186,43 +375,57 @@ sgError_t sgMemcpyD2H(void* dst, sgDevPtr src, size_t bytes) {
     sg_cmd c = make_cmd(SG_OP_COPY_D2H);
     c.src0 = src;
     c.size = bytes;
-    return submit_copy_sync(c, reinterpret_cast<uint64_t>(dst));
+    return copy_sync(&g_default_stream, c, reinterpret_cast<uint64_t>(dst));
 }
 
-sgError_t sgMemcpyH2DAsync(sgDevPtr dst, const void* src, size_t bytes, sgStream_t stream) {
-    if (!src || stream != nullptr) return SG_ERR_INVALID_VALUE;
-    sg_cmd c = make_cmd(SG_OP_COPY_H2D);
-    c.dst = dst;
-    c.size = bytes;
-    return submit(c, reinterpret_cast<uint64_t>(src));
-}
-
-sgError_t sgMemcpyD2HAsync(void* dst, sgDevPtr src, size_t bytes, sgStream_t stream) {
-    if (!dst || stream != nullptr) return SG_ERR_INVALID_VALUE;
-    sg_cmd c = make_cmd(SG_OP_COPY_D2H);
-    c.src0 = src;
-    c.size = bytes;
-    return submit(c, reinterpret_cast<uint64_t>(dst));
-}
-
-sgError_t sgMemcpyD2D(sgDevPtr dst, sgDevPtr src, size_t bytes) {
+sgError_t sgMemcpyD2DAsync(sgDevPtr dst, sgDevPtr src, size_t bytes, sgStream_t stream) {
+    sgStream* s = resolve(stream);
     sg_cmd c = make_cmd(SG_OP_COPY_D2D);
     c.dst = dst;
     c.src0 = src;
     c.size = bytes;
-    return submit(c);
+    return stream_submit(s, s->ce, c);
 }
 
-sgError_t sgVaddF32(sgDevPtr c_, sgDevPtr a, sgDevPtr b, uint32_t n) {
+sgError_t sgMemcpyD2D(sgDevPtr dst, sgDevPtr src, size_t bytes) {
+    return sgMemcpyD2DAsync(dst, src, bytes, nullptr);
+}
+
+sgError_t sgMemcpyH2DAsync(sgDevPtr dst, const void* src, size_t bytes, sgStream_t stream) {
+    if (!src) return SG_ERR_INVALID_VALUE;
+    sgStream* s = resolve(stream);
+    sg_cmd c = make_cmd(SG_OP_COPY_H2D);
+    c.dst = dst;
+    c.size = bytes;
+    return stream_submit(s, s->ce, c, reinterpret_cast<uint64_t>(src));
+}
+
+sgError_t sgMemcpyD2HAsync(void* dst, sgDevPtr src, size_t bytes, sgStream_t stream) {
+    if (!dst) return SG_ERR_INVALID_VALUE;
+    sgStream* s = resolve(stream);
+    sg_cmd c = make_cmd(SG_OP_COPY_D2H);
+    c.src0 = src;
+    c.size = bytes;
+    return stream_submit(s, s->ce, c, reinterpret_cast<uint64_t>(dst));
+}
+
+// ---- compute -------------------------------------------------------------
+
+sgError_t sgVaddF32Async(sgDevPtr c_, sgDevPtr a, sgDevPtr b, uint32_t n, sgStream_t stream) {
     sg_cmd c = make_cmd(SG_OP_VADD_F32);
     c.dst = c_;
     c.src0 = a;
     c.src1 = b;
     c.arg0 = n;
-    return submit(c);
+    return stream_submit(resolve(stream), SG_ENGINE_COMPUTE, c);
 }
 
-sgError_t sgGemmF32(sgDevPtr c_, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, uint32_t k) {
+sgError_t sgVaddF32(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t n) {
+    return sgVaddF32Async(c, a, b, n, nullptr);
+}
+
+sgError_t sgGemmF32Async(sgDevPtr c_, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, uint32_t k,
+                         sgStream_t stream) {
     sg_cmd c = make_cmd(SG_OP_GEMM_F32);
     c.dst = c_;
     c.src0 = a;
@@ -230,12 +433,18 @@ sgError_t sgGemmF32(sgDevPtr c_, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n,
     c.arg0 = m;
     c.arg1 = n;
     c.arg2 = k;
-    return submit(c);
+    return stream_submit(resolve(stream), SG_ENGINE_COMPUTE, c);
 }
+
+sgError_t sgGemmF32(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, uint32_t k) {
+    return sgGemmF32Async(c, a, b, m, n, k, nullptr);
+}
+
+// ---- synchronization and telemetry -----------------------------------------
 
 sgError_t sgDeviceSynchronize(void) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
-    return wait_fence(g_last_fence.load(std::memory_order_relaxed));
+    return wait_all();
 }
 
 sgError_t sgGetStats(sgStats_t* out) {
@@ -244,18 +453,23 @@ sgError_t sgGetStats(sgStats_t* out) {
     sg_stats_args s{};
     int rc = sg_drv_ioctl(g_fd, SG_IOC_STATS, &s);
     if (rc == 0) {
-        out->device_busy_cycles = s.busy_cycles;
-        out->device_idle_cycles = s.idle_cycles;
-        out->device_cmds_executed = s.cmds_executed;
-        out->device_batches = s.batches;
+        std::memset(out, 0, sizeof *out);
+        out->num_engines = s.num_engines;
+        for (uint32_t e = 0; e < s.num_engines && e < SG_MAX_ENGINES_RT; ++e) {
+            out->engine_busy_cycles[e] = s.busy_cycles[e];
+            out->engine_wait_cycles[e] = s.wait_cycles[e];
+            out->engine_idle_cycles[e] = s.idle_cycles[e];
+            out->engine_cmds[e] = s.cmds_executed[e];
+            out->engine_batches[e] = s.batches[e];
+        }
         out->driver_submits = s.submits;
         out->driver_waits = s.waits;
         out->driver_stalls = s.stalls;
         out->staging_waits = s.staging_waits;
-        out->bytes_direct = s.bytes_direct;
-        out->bytes_staged = s.bytes_staged;
         out->bytes_h2d = s.bytes_h2d;
         out->bytes_d2h = s.bytes_d2h;
+        out->bytes_direct = s.bytes_direct;
+        out->bytes_staged = s.bytes_staged;
     }
     return from_errno(rc);
 }

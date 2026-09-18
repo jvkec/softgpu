@@ -260,9 +260,16 @@ void bench_gemm(const Options& o, Report& rep) {
 
 void bench_mt(const Options& o, Report& rep) {
     const int per_thread = o.quick ? 2000 : 20000;
+    // Two variants: every thread on the default stream (they serialize on
+    // the stream's own lock as well as the driver's), and one stream per
+    // thread (only the driver lock is shared).
+    for (int own_stream = 0; own_stream < 2; ++own_stream)
     for (int T = 1; T <= o.threads_max; T *= 2) {
         std::vector<sgDevPtr> bufs(T);
         for (auto& b : bufs) b = must_malloc(4096);
+        std::vector<sgStream_t> streams(T, nullptr);
+        if (own_stream)
+            for (auto& st : streams) die_on(sgStreamCreate(&st), "sgStreamCreate");
 
         std::atomic<int> go{0};
         std::vector<std::thread> ts;
@@ -277,10 +284,10 @@ void bench_mt(const Options& o, Report& rep) {
                 const double c0 = thread_cpu_ns();
                 for (int i = 0; i < per_thread; ++i) {
                     auto t0 = Clock::now();
-                    die_on(sgMemset(bufs[t], i, 4096), "memset");
+                    die_on(sgMemsetAsync(bufs[t], i, 4096, streams[t]), "memset");
                     lats[t].push_back(ns_since(t0));
                 }
-                die_on(sgDeviceSynchronize(), "sync");
+                die_on(sgStreamSynchronize(streams[t]), "sync");
                 cpu[t] = thread_cpu_ns() - c0;
             });
         go.store(1, std::memory_order_release);
@@ -292,13 +299,84 @@ void bench_mt(const Options& o, Report& rep) {
         std::vector<double> all;
         for (auto& l : lats) all.insert(all.end(), l.begin(), l.end());
         char name[32];
-        std::snprintf(name, sizeof name, "threads=%d", T);
+        std::snprintf(name, sizeof name, "threads=%d%s", T, own_stream ? "_streams" : "");
         Row r{"mt", name, {}};
         r.metrics["ops_per_s"] = double(T) * per_thread / (w.wall_ns() / 1e9);
         latency_row(r, all);
         w.fill(r, double(T) * per_thread);
         rep.rows.push_back(r);
         for (auto b : bufs) sgFree(b);
+        if (own_stream)
+            for (auto st : streams) sgStreamDestroy(st);
+    }
+}
+
+} // namespace bench
+
+namespace bench {
+
+// Streams: a chunked H2D -> compute -> D2H workload spread over S streams.
+// With one stream nothing can overlap (in-order), even though the device has
+// a copy engine and a compute engine; with two or more, copies of chunk i+1
+// run while chunk i computes. R repetitions of the kernel per chunk set the
+// copy:compute ratio (R=1 copy-heavy, R=4 compute-heavy).
+void bench_pipeline(const Options& o, Report& rep) {
+    const int chunks = o.quick ? 4 : 16;
+    const uint32_t n = 1u << 20; // floats per chunk (4 MiB per array)
+    const size_t bytes = size_t(n) * 4;
+
+    std::vector<float*> ha(chunks), hb(chunks), hc(chunks);
+    std::vector<sgDevPtr> da(chunks), db(chunks), dc(chunks);
+    for (int i = 0; i < chunks; ++i) {
+        die_on(sgMallocHost(reinterpret_cast<void**>(&ha[i]), bytes), "sgMallocHost");
+        die_on(sgMallocHost(reinterpret_cast<void**>(&hb[i]), bytes), "sgMallocHost");
+        die_on(sgMallocHost(reinterpret_cast<void**>(&hc[i]), bytes), "sgMallocHost");
+        std::fill(ha[i], ha[i] + n, 1.0f);
+        std::fill(hb[i], hb[i] + n, 2.0f);
+        da[i] = must_malloc(bytes);
+        db[i] = must_malloc(bytes);
+        dc[i] = must_malloc(bytes);
+    }
+
+    for (int R : {1, 4}) {
+        double t_s1 = 0;
+        for (int S : {1, 2, 4}) {
+            std::vector<sgStream_t> streams(S);
+            for (auto& s : streams) die_on(sgStreamCreate(&s), "sgStreamCreate");
+            auto run = [&] {
+                for (int i = 0; i < chunks; ++i) {
+                    sgStream_t s = streams[i % S];
+                    die_on(sgMemcpyH2DAsync(da[i], ha[i], bytes, s), "h2d");
+                    die_on(sgMemcpyH2DAsync(db[i], hb[i], bytes, s), "h2d");
+                    die_on(sgVaddF32Async(dc[i], da[i], db[i], n, s), "vadd");
+                    for (int r = 1; r < R; ++r) die_on(sgVaddF32Async(dc[i], dc[i], db[i], n, s), "vadd");
+                    die_on(sgMemcpyD2HAsync(hc[i], dc[i], bytes, s), "d2h");
+                }
+                die_on(sgDeviceSynchronize(), "sync");
+            };
+            run(); // warm up
+            const int iters = o.quick ? 1 : 3;
+            Window w;
+            w.begin();
+            for (int it = 0; it < iters; ++it) run();
+            w.end();
+            for (auto& s : streams) sgStreamDestroy(s);
+
+            char name[32];
+            std::snprintf(name, sizeof name, "R=%d_S=%d", R, S);
+            Row r{"pipeline", name, {}};
+            const double us_per_chunk = w.wall_ns() / (double(iters) * chunks) / 1e3;
+            if (S == 1) t_s1 = us_per_chunk;
+            r.metrics["us_per_chunk"] = us_per_chunk;
+            r.metrics["speedup_vs_S1"] = t_s1 / us_per_chunk;
+            w.fill(r, double(iters) * chunks);
+            rep.rows.push_back(r);
+        }
+    }
+
+    for (int i = 0; i < chunks; ++i) {
+        sgFree(da[i]); sgFree(db[i]); sgFree(dc[i]);
+        sgFreeHost(ha[i]); sgFreeHost(hb[i]); sgFreeHost(hc[i]);
     }
 }
 

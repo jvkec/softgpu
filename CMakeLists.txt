@@ -60,3 +60,7 @@ set_tests_properties(runtime_ring2 PROPERTIES ENVIRONMENT "SG_RING_DEPTH=2")
 # chunks and every chunk waits on the previous one.
 add_test(NAME runtime_staging1 COMMAND sgtest)
 set_tests_properties(runtime_staging1 PROPERTIES ENVIRONMENT "SG_STAGING_SLOTS=1;SG_STAGING_CHUNK=65536")
+# Two copy engines: streams alternate engines, so cross-engine fences are
+# exercised between copy engines as well as against compute.
+add_test(NAME runtime_ce2 COMMAND sgtest)
+set_tests_properties(runtime_ce2 PROPERTIES ENVIRONMENT "SG_COPY_ENGINES=2")
