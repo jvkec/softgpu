@@ -63,6 +63,7 @@ void Device::reset_stats() {
         st.idle_cycles.store(0, std::memory_order_relaxed);
         st.cmds_executed.store(0, std::memory_order_relaxed);
         st.batches.store(0, std::memory_order_relaxed);
+        st.irqs.store(0, std::memory_order_relaxed);
         st.stats_gen.fetch_add(1, std::memory_order_release);
     }
 }
@@ -131,6 +132,18 @@ void Device::run(uint32_t engine) {
                 // results) so a host or another channel waiting on an early
                 // fence is not held up by the rest. Also frees the slot.
                 ch.get.store(k.get, std::memory_order_release);
+                // Interrupt: only when the driver armed one for a fence we
+                // just passed. Clearing before signalling means a waiter that
+                // re-arms after waking cannot miss a later fence.
+                const uint64_t tgt = ch.irq_target.load(std::memory_order_acquire);
+                if (tgt != 0 && k.get >= tgt) {
+                    ch.irq_target.store(0, std::memory_order_relaxed);
+                    const uint64_t t = now_cycles();
+                    ch.last_irq_cycles.store(t, std::memory_order_relaxed);
+                    note_irq(t);
+                    st.irqs.fetch_add(1, std::memory_order_relaxed);
+                    irq_.signal();
+                }
                 if (k.get == put) put = ch.put.load(std::memory_order_acquire);
             }
         }

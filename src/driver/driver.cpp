@@ -1,3 +1,9 @@
+// STAGE 2 (built after 3b): interrupts and a wait policy. Every place the
+// host used to spin on a fence register now goes through wait_until(): spin
+// for a budget, then arm the channel's interrupt and sleep on the device's
+// IRQ line until it fires. SG_WAIT_POLICY selects spin / block / hybrid /
+// adaptive; per-call flags can force spin or block.
+//
 // STAGE 3b driver: engines, channels, cross-channel fences.
 //
 // What changed from stage 3a:
@@ -30,6 +36,7 @@
 #include <mutex>
 #include <vector>
 
+#include "common/clock.h"
 #include "common/cpu.h"
 #include "device/device.h"
 #include "driver/vram_alloc.h"
@@ -60,6 +67,16 @@ uint32_t staging_slots_from_env() { return uint32_t(env_pow2("SG_STAGING_SLOTS",
 uint64_t staging_chunk_from_env() { return env_pow2("SG_STAGING_CHUNK", SG_STAGING_CHUNK, 4096, 64ull << 20); }
 uint32_t copy_engines_from_env() { return uint32_t(env_int("SG_COPY_ENGINES", SG_COPY_ENGINES, 1, SG_MAX_ENGINES - 1)); }
 uint32_t channels_from_env() { return uint32_t(env_int("SG_CHANNELS", SG_CHANNELS, 1, SG_MAX_CHANNELS)); }
+constexpr uint64_t kDefaultSpinNs = 30000; // hybrid budget / adaptive cap: ~ the measured wake-up latency (ADR 004)
+uint64_t spin_ns_from_env() { return env_int("SG_SPIN_NS", kDefaultSpinNs, 0, 1000000000ull); }
+uint32_t policy_from_env() {
+    const char* e = std::getenv("SG_WAIT_POLICY");
+    if (!e) return SG_POLICY_ADAPTIVE; // default chosen from the sweep in ADR 004
+    if (!std::strcmp(e, "spin")) return SG_POLICY_SPIN;
+    if (!std::strcmp(e, "block")) return SG_POLICY_BLOCK;
+    if (!std::strcmp(e, "hybrid")) return SG_POLICY_HYBRID;
+    return SG_POLICY_ADAPTIVE;
+}
 // SG_DEVICE_CPU=<n> pins the compute engine's thread; -1 (default) leaves it to the OS.
 int device_cpu_from_env() {
     const char* e = std::getenv("SG_DEVICE_CPU");
@@ -108,10 +125,16 @@ struct Driver {
     std::map<uint64_t, uint64_t> pins; // pinned host ranges: addr -> size
     std::vector<Pending> pending;      // deferred frees / unpins
 
-    // `waits` is bumped by SG_IOC_WAIT, which runs without the driver lock
-    // by design (a thread synchronizing must not block submitters), so it is
-    // the one counter that must be atomic. TSan found this in stage 3a.
-    std::atomic<uint64_t> waits{0};
+    // Wait policy. The counters and the adaptive estimators are touched by
+    // SG_IOC_WAIT, which runs without the driver lock by design (a thread
+    // synchronizing must not block submitters), so they are atomic.
+    uint32_t policy = SG_POLICY_ADAPTIVE;
+    uint64_t spin_ns = kDefaultSpinNs;
+    std::atomic<uint64_t> waits{0}, waits_spun{0}, waits_blocked{0}, wake_latency_ns{0};
+    // Adaptive: EWMA (ns) of recent total wait durations, per channel and
+    // for SG_WAIT_ALL. A channel whose waits are long gets a short spin.
+    std::atomic<uint64_t> ewma[SG_MAX_ENGINES][SG_MAX_CHANNELS] = {};
+    std::atomic<uint64_t> ewma_all{0};
     uint64_t submits = 0, stalls = 0, staging_waits = 0;
     uint64_t bytes_h2d = 0, bytes_d2h = 0, bytes_direct = 0, bytes_staged = 0;
 
@@ -132,6 +155,8 @@ struct Driver {
         chunk = staging_chunk_from_env();
         staging.assign(size_t{slots} * chunk, 0);
         slot_fence.assign(slots, Fence{});
+        policy = policy_from_env();
+        spin_ns = spin_ns_from_env();
     }
 
     uint8_t* slot(uint32_t i) { return staging.data() + size_t{i} * chunk; }
@@ -151,12 +176,123 @@ inline uint64_t retired(Driver& d, uint32_t e, uint32_t c) {
     return d.dev.channel(e, c).get.load(std::memory_order_acquire);
 }
 
+// Arm the interrupt on a channel for `target`, keeping the lowest armed
+// value so no waiter's fence can be skipped. The engine clears it on fire;
+// a still-waiting thread re-arms after it wakes.
+void arm_irq(Driver& d, uint32_t e, uint32_t c, uint64_t target) {
+    auto& t = d.dev.channel(e, c).irq_target;
+    uint64_t cur = t.load(std::memory_order_relaxed);
+    while ((cur == 0 || cur > target) &&
+           !t.compare_exchange_weak(cur, target, std::memory_order_release, std::memory_order_relaxed)) {}
+}
+
+constexpr uint64_t kMinSpinNs = 200;       // always spin at least one round trip
+constexpr uint64_t kAdaptiveFloorNs = 2000; // adaptive never predicts below this: cheap insurance
+                                            // against blocking (and a 30 us wake) on sub-us chains
+constexpr uint64_t kBlockTimeoutNs = 1000000; // safety net: re-check every 1 ms even without an IRQ
+
+// The one wait primitive. `pred` is true when the wait is over; `arm` arms
+// the interrupt(s) the waiter depends on. Spins for a budget chosen by the
+// policy, then arms and sleeps on the IRQ line. The arm-then-check order is
+// what closes the race between "fence not yet passed" and "interrupt fired
+// before we slept": the engine clears irq_target only after storing get, so
+// a check after arming either sees the fence or is guaranteed a signal.
+// Returns 0 if no wait was needed, 1 if satisfied while spinning, 2 if it
+// slept. Callers account the wait to the right counter.
+enum { kNoWait = 0, kSpun = 1, kBlocked = 2 };
+template <class Pred, class Arm>
+int wait_until(Driver& d, Pred pred, Arm arm, uint32_t flags, std::atomic<uint64_t>* ewma) {
+    if (pred()) return kNoWait;
+
+    uint64_t budget;
+    uint32_t policy = d.policy;
+    if (flags & SG_WAIT_SPIN) policy = SG_POLICY_SPIN;
+    else if (flags & SG_WAIT_BLOCK) policy = SG_POLICY_BLOCK;
+    switch (policy) {
+    case SG_POLICY_SPIN:  budget = ~0ull; break;
+    case SG_POLICY_BLOCK: budget = 0; break;
+    case SG_POLICY_ADAPTIVE: {
+        // Expect this wait to look like recent ones: spin for about twice
+        // the typical wait if that fits the cap, otherwise go straight to
+        // sleep (after the minimum spin that catches nearly-done fences).
+        const uint64_t typical = ewma ? ewma->load(std::memory_order_relaxed) : 0;
+        budget = typical == 0 ? d.spin_ns
+               : typical > d.spin_ns ? kAdaptiveFloorNs
+               : std::max<uint64_t>(kAdaptiveFloorNs, std::min<uint64_t>(2 * typical, d.spin_ns));
+        break;
+    }
+    default: budget = d.spin_ns; break;
+    }
+
+    // Spin phase. The clock is read only after the first round of spinning
+    // fails; the first round is long enough (~1 us) to cover a device round
+    // trip, so a wait that is satisfied that quickly costs the same as the
+    // old pure spin — the fast path pays for no timing at all.
+    bool done = false;
+    uint64_t t0 = 0;
+    for (int round = 0;; ++round) {
+        const int iters = round == 0 ? 512 : 32;
+        for (int i = 0; i < iters; ++i) {
+            if (pred()) { done = true; break; }
+            cpu_relax();
+        }
+        if (done) break;
+        if (t0 == 0) t0 = now_cycles();
+        else if (budget != ~0ull && now_cycles() - t0 >= budget) break;
+    }
+    if (done) {
+        d.waits_spun.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        // Block phase.
+        d.waits_blocked.fetch_add(1, std::memory_order_relaxed);
+        Event& irq = d.dev.irq();
+        for (;;) {
+            const uint32_t seen = irq.seq();
+            arm();
+            if (pred()) break;
+            irq.wait(seen, kBlockTimeoutNs);
+            if (pred()) break;
+        }
+    }
+    // Only the adaptive policy needs to know how long this took; the other
+    // policies never pay for a clock read on a wait that ends in the first
+    // spin round. A wait that ended before t0 was taken counts as ~one round.
+    //
+    // For a blocked wait, measure until the fence *passed* (the interrupt
+    // timestamp), not until this thread woke: the wake-up latency is the
+    // policy's own penalty, and feeding it back into the estimate makes one
+    // blocked wait predict "long" forever — the first version of this code
+    // did exactly that (ADR 004).
+    if (policy == SG_POLICY_ADAPTIVE && ewma) {
+        uint64_t dur = kMinSpinNs;
+        if (t0) {
+            const uint64_t end = done ? now_cycles() : d.dev.last_irq_cycles();
+            dur = end > t0 ? end - t0 : kMinSpinNs;
+        }
+        const uint64_t old = ewma->load(std::memory_order_relaxed);
+        ewma->store(old == 0 ? dur : (3 * old + dur) / 4, std::memory_order_relaxed);
+    }
+    return done ? kSpun : kBlocked;
+}
+
+// Wake-up latency: from the last interrupt pulse to this waiter running.
+void note_wake(Driver& d) {
+    const uint64_t fired = d.dev.last_irq_cycles();
+    const uint64_t now = now_cycles();
+    if (fired && now > fired) d.wake_latency_ns.fetch_add(now - fired, std::memory_order_relaxed);
+}
+
 // Block until (engine, channel) has retired everything up to `value`.
-int wait_fence(Driver& d, Fence f, uint64_t* counter = nullptr) {
-    if (retired(d, f.engine, f.channel) < f.value) {
-        if (counter) ++*counter;
+int wait_fence(Driver& d, Fence f, uint64_t* counter = nullptr, uint32_t flags = SG_WAIT_DEFAULT) {
+    auto& ch = d.dev.channel(f.engine, f.channel);
+    const int r = wait_until(
+        d, [&] { return retired(d, f.engine, f.channel) >= f.value; },
+        [&] { arm_irq(d, f.engine, f.channel, f.value); }, flags, &d.ewma[f.engine][f.channel]);
+    (void)ch;
+    if (r == kBlocked) note_wake(d);
+    if (r != kNoWait) {
+        if (counter) ++*counter; // a staging-slot wait, accounted separately
         else d.waits.fetch_add(1, std::memory_order_relaxed);
-        while (retired(d, f.engine, f.channel) < f.value) cpu_relax();
     }
     return sticky(d) ? -EIO : 0;
 }
@@ -173,11 +309,17 @@ bool all_retired(Driver& d, const PutSnapshot fence) {
 
 // Block until every channel has retired a PUT snapshot. Lock-free; the
 // snapshot itself must have been taken under the lock.
-int wait_snapshot(Driver& d, const PutSnapshot fence) {
-    if (!all_retired(d, fence)) {
-        d.waits.fetch_add(1, std::memory_order_relaxed);
-        while (!all_retired(d, fence)) cpu_relax();
-    }
+int wait_snapshot(Driver& d, const PutSnapshot fence, uint32_t flags = SG_WAIT_DEFAULT) {
+    const int r = wait_until(
+        d, [&] { return all_retired(d, fence); },
+        [&] {
+            for (uint32_t e = 0; e < d.num_engines; ++e)
+                for (uint32_t c = 0; c < d.num_channels; ++c)
+                    if (fence[e][c] && retired(d, e, c) < fence[e][c]) arm_irq(d, e, c, fence[e][c]);
+        },
+        flags, &d.ewma_all);
+    if (r == kBlocked) note_wake(d);
+    if (r != kNoWait) d.waits.fetch_add(1, std::memory_order_relaxed);
     return sticky(d) ? -EIO : 0;
 }
 
@@ -196,7 +338,10 @@ uint64_t enqueue(Driver& d, uint32_t engine, uint32_t channel, const sg_cmd& cmd
     uint64_t& put = d.put[engine][channel];
     if (put - retired(d, engine, channel) >= d.depth) {
         ++d.stalls;
-        while (put - retired(d, engine, channel) >= d.depth) cpu_relax();
+        // Full ring: wait for the oldest in-flight command on this channel.
+        const uint64_t need = put - d.depth + 1;
+        wait_until(d, [&] { return retired(d, engine, channel) >= need; },
+                   [&] { arm_irq(d, engine, channel, need); }, SG_WAIT_DEFAULT, nullptr);
     }
     d.ring[engine][channel].get()[put & (d.depth - 1)] = cmd;
     ++put;
@@ -427,10 +572,10 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
                 std::lock_guard<std::mutex> g(d.lock);
                 snapshot_puts(d, snap);
             }
-            return wait_snapshot(d, snap);
+            return wait_snapshot(d, snap, w->flags);
         }
         if (w->engine >= d.num_engines || w->channel >= d.num_channels) return -EINVAL;
-        return wait_fence(d, {w->engine, w->channel, w->fence});
+        return wait_fence(d, {w->engine, w->channel, w->fence}, nullptr, w->flags);
     }
 
     std::lock_guard<std::mutex> g(d.lock);
@@ -444,6 +589,9 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         q->staging_chunk = d.chunk;
         q->num_engines = d.num_engines;
         q->num_channels = d.num_channels;
+        q->wait_policy = d.policy;
+        q->reserved2 = 0;
+        q->spin_ns = d.spin_ns;
         return 0;
     }
     case SG_IOC_ALLOC: {
@@ -520,9 +668,13 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
             s->idle_cycles[e] = st.idle_cycles.load(std::memory_order_relaxed);
             s->cmds_executed[e] = st.cmds_executed.load(std::memory_order_relaxed);
             s->batches[e] = st.batches.load(std::memory_order_relaxed);
+            s->irqs[e] = st.irqs.load(std::memory_order_relaxed);
         }
         s->submits = d.submits;
         s->waits = d.waits.load(std::memory_order_relaxed);
+        s->waits_spun = d.waits_spun.load(std::memory_order_relaxed);
+        s->waits_blocked = d.waits_blocked.load(std::memory_order_relaxed);
+        s->wake_latency_ns = d.wake_latency_ns.load(std::memory_order_relaxed);
         s->stalls = d.stalls;
         s->staging_waits = d.staging_waits;
         s->bytes_h2d = d.bytes_h2d;
@@ -535,6 +687,9 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         d.dev.reset_stats();
         d.submits = d.stalls = d.staging_waits = 0;
         d.waits.store(0, std::memory_order_relaxed);
+        d.waits_spun.store(0, std::memory_order_relaxed);
+        d.waits_blocked.store(0, std::memory_order_relaxed);
+        d.wake_latency_ns.store(0, std::memory_order_relaxed);
         d.bytes_h2d = d.bytes_d2h = d.bytes_direct = d.bytes_staged = 0;
         return 0;
     default:

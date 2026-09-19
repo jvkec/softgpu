@@ -106,8 +106,8 @@ case "$cmd" in
     sels=(); flags=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        all) sels+=(submit batch memcpy vadd gemm mt alloc pipeline) ;;
-        submit|batch|memcpy|vadd|gemm|mt|alloc|pipeline) sels+=("$1") ;;
+        all) sels+=(submit batch memcpy vadd gemm mt alloc pipeline wait) ;;
+        submit|batch|memcpy|vadd|gemm|mt|alloc|pipeline|wait) sels+=("$1") ;;
         --json|--tag|--threads|--repeat) flags+=("$1" "$2"); shift ;;
         *) flags+=("$1") ;;
       esac

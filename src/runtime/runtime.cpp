@@ -54,6 +54,7 @@ int g_fd = -1;
 uint32_t g_num_engines = 1;
 uint32_t g_num_ce = 0;
 uint32_t g_num_channels = 1;
+std::atomic<uint32_t> g_sync_flags{SG_WAIT_DEFAULT}; // from sgSetSyncPolicy
 std::atomic<uint32_t> g_next_stream_id{1};
 sgStream g_default_stream; // NULL maps here; id 0
 
@@ -71,13 +72,13 @@ sgError_t from_errno(int rc) {
 }
 
 sgError_t wait_fence(const sgFence& f) {
-    sg_wait_args w{f.engine, f.channel, f.value};
+    sg_wait_args w{f.engine, f.channel, f.value, g_sync_flags.load(std::memory_order_relaxed), 0};
     return from_errno(sg_drv_ioctl(g_fd, SG_IOC_WAIT, &w));
 }
 
 // Everything submitted so far by any thread, on every engine and channel.
 sgError_t wait_all() {
-    sg_wait_args w{SG_WAIT_ALL, 0, 0};
+    sg_wait_args w{SG_WAIT_ALL, 0, 0, g_sync_flags.load(std::memory_order_relaxed), 0};
     return from_errno(sg_drv_ioctl(g_fd, SG_IOC_WAIT, &w));
 }
 
@@ -442,6 +443,15 @@ sgError_t sgGemmF32(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, 
 
 // ---- synchronization and telemetry -----------------------------------------
 
+sgError_t sgSetSyncPolicy(sgSyncPolicy_t policy) {
+    switch (policy) {
+    case SG_SYNC_DEFAULT: g_sync_flags.store(SG_WAIT_DEFAULT, std::memory_order_relaxed); return SG_OK;
+    case SG_SYNC_SPIN:    g_sync_flags.store(SG_WAIT_SPIN, std::memory_order_relaxed); return SG_OK;
+    case SG_SYNC_BLOCK:   g_sync_flags.store(SG_WAIT_BLOCK, std::memory_order_relaxed); return SG_OK;
+    default:              return SG_ERR_INVALID_VALUE;
+    }
+}
+
 sgError_t sgDeviceSynchronize(void) {
     if (g_fd < 0) return SG_ERR_NOT_INITIALIZED;
     return wait_all();
@@ -461,9 +471,13 @@ sgError_t sgGetStats(sgStats_t* out) {
             out->engine_idle_cycles[e] = s.idle_cycles[e];
             out->engine_cmds[e] = s.cmds_executed[e];
             out->engine_batches[e] = s.batches[e];
+            out->engine_irqs[e] = s.irqs[e];
         }
         out->driver_submits = s.submits;
         out->driver_waits = s.waits;
+        out->waits_spun = s.waits_spun;
+        out->waits_blocked = s.waits_blocked;
+        out->wake_latency_ns = s.wake_latency_ns;
         out->driver_stalls = s.stalls;
         out->staging_waits = s.staging_waits;
         out->bytes_h2d = s.bytes_h2d;

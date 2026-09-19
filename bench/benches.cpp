@@ -381,3 +381,57 @@ void bench_pipeline(const Options& o, Report& rep) {
 }
 
 } // namespace bench
+
+namespace bench {
+
+// Wait policy: one command of known duration, then synchronize, under each
+// host-side policy the runtime can ask for (spin / block / driver default).
+// The tradeoff is wall time (wake-up latency) against submitter CPU (power).
+void bench_wait(const Options& o, Report& rep) {
+    struct Work { const char* name; uint32_t dim; int iters; };
+    const Work works[] = {
+        {"fill4K", 0, o.quick ? 2000 : 20000},       // ~0.3 us
+        {"gemm32", 32, o.quick ? 200 : 2000},        // ~10 us
+        {"gemm128", 128, o.quick ? 50 : 500},        // ~200 us
+        {"gemm512", 512, o.quick ? 3 : 20},          // ~14 ms
+    };
+    struct Pol { const char* name; sgSyncPolicy_t p; } pols[] = {
+        {"spin", SG_SYNC_SPIN}, {"block", SG_SYNC_BLOCK}, {"default", SG_SYNC_DEFAULT}};
+
+    for (const auto& wk : works) {
+        const size_t bytes = wk.dim ? size_t(wk.dim) * wk.dim * 4 : 4096;
+        sgDevPtr a = must_malloc(bytes), b = must_malloc(bytes), c = must_malloc(bytes);
+        die_on(sgMemset(a, 0, bytes), "memset");
+        die_on(sgMemset(b, 0, bytes), "memset");
+        for (const auto& pol : pols) {
+            die_on(sgSetSyncPolicy(pol.p), "sgSetSyncPolicy");
+            auto op = [&] {
+                return wk.dim ? sgGemmF32(c, a, b, wk.dim, wk.dim, wk.dim) : sgMemset(c, 1, bytes);
+            };
+            op(); sgDeviceSynchronize();
+            std::vector<double> lat;
+            lat.reserve(wk.iters);
+            Window w;
+            w.begin();
+            for (int i = 0; i < wk.iters; ++i) {
+                auto t0 = Clock::now();
+                die_on(op(), wk.name);
+                die_on(sgDeviceSynchronize(), "sync");
+                lat.push_back(ns_since(t0));
+            }
+            w.end();
+            char name[48];
+            std::snprintf(name, sizeof name, "%s_%s", wk.name, pol.name);
+            Row r{"wait", name, {}};
+            latency_row(r, lat);
+            r.metrics["us_per_op"] = w.wall_ns() / wk.iters / 1e3;
+            r.metrics["cpu_us_per_op"] = w.cpu_ns() / wk.iters / 1e3;
+            w.fill(r, wk.iters);
+            rep.rows.push_back(r);
+        }
+        die_on(sgSetSyncPolicy(SG_SYNC_DEFAULT), "sgSetSyncPolicy");
+        sgFree(a); sgFree(b); sgFree(c);
+    }
+}
+
+} // namespace bench

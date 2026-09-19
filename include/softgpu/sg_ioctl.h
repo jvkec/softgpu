@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   4u
+#define SG_ABI_VERSION   5u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_STAGING_SLOTS 8u             /* default pageable-copy staging pool ...    */
 #define SG_STAGING_CHUNK (256ull << 10) /* ... 8 x 256 KiB, from the sweep in ADR 002 */
@@ -39,6 +39,19 @@ extern "C" {
 #define SG_COPY_ENGINES   1u            /* default number of copy engines (SG_COPY_ENGINES env)   */
 #define SG_CHANNELS       8u            /* default channels per engine (SG_CHANNELS env)          */
 #define SG_WAIT_ALL       0xffffffffu   /* sg_wait_args.engine: wait for everything submitted so far */
+
+/*
+ * How the host waits for a fence. The device raises an interrupt when a
+ * channel's fence passes an armed value; the driver either spins on the
+ * fence register, blocks until the interrupt, or spins briefly then blocks.
+ * SG_WAIT_DEFAULT uses the driver's configured policy (SG_WAIT_POLICY env:
+ * spin | block | hybrid | adaptive; SG_SPIN_NS sets the hybrid budget).
+ */
+#define SG_WAIT_DEFAULT   0u            /* driver policy; default: adaptive, 30 us cap */
+#define SG_WAIT_SPIN      1u            /* sg_wait_args.flags: never sleep            */
+#define SG_WAIT_BLOCK     2u            /* sg_wait_args.flags: sleep without spinning */
+
+enum sg_wait_policy { SG_POLICY_SPIN = 0, SG_POLICY_BLOCK = 1, SG_POLICY_HYBRID = 2, SG_POLICY_ADAPTIVE = 3 };
 
 enum sg_opcode {
     SG_OP_NOP        = 0,
@@ -78,6 +91,9 @@ struct sg_query_args {
     uint64_t staging_chunk;
     uint32_t num_engines;  /* 1 compute + copy engines */
     uint32_t num_channels; /* rings per engine         */
+    uint32_t wait_policy;  /* enum sg_wait_policy in effect */
+    uint32_t reserved2;
+    uint64_t spin_ns;      /* spin budget before blocking (hybrid; cap for adaptive) */
 };
 
 struct sg_alloc_args {
@@ -120,6 +136,8 @@ struct sg_wait_args {
     uint32_t engine;
     uint32_t channel;
     uint64_t fence;
+    uint32_t flags;    /* SG_WAIT_DEFAULT / SG_WAIT_SPIN / SG_WAIT_BLOCK */
+    uint32_t reserved;
 };
 
 struct sg_stats_args {
@@ -131,9 +149,13 @@ struct sg_stats_args {
     uint64_t idle_cycles[SG_MAX_ENGINES];   /* no commands                          */
     uint64_t cmds_executed[SG_MAX_ENGINES];
     uint64_t batches[SG_MAX_ENGINES];       /* idle->busy transitions               */
+    uint64_t irqs[SG_MAX_ENGINES];          /* interrupts raised                    */
     /* driver-side */
     uint64_t submits;       /* driver: SG_IOC_SUBMIT calls                      */
-    uint64_t waits;         /* driver: times the host blocked on a fence        */
+    uint64_t waits;         /* driver: times the host had to wait on a fence    */
+    uint64_t waits_spun;    /* ... of which satisfied while spinning            */
+    uint64_t waits_blocked; /* ... of which went to sleep                       */
+    uint64_t wake_latency_ns; /* sum over blocked waits: retire -> waiter awake */
     uint64_t stalls;        /* driver: times submission blocked on a full ring  */
     uint64_t staging_waits; /* driver: times the host blocked for a staging slot */
     uint64_t bytes_h2d;

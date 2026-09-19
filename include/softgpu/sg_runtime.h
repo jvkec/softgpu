@@ -50,8 +50,12 @@ typedef struct sgStats {
     uint64_t engine_idle_cycles[SG_MAX_ENGINES_RT];  /* nothing queued         */
     uint64_t engine_cmds[SG_MAX_ENGINES_RT];
     uint64_t engine_batches[SG_MAX_ENGINES_RT];      /* idle->busy wakes       */
+    uint64_t engine_irqs[SG_MAX_ENGINES_RT];         /* interrupts raised      */
     uint64_t driver_submits;
-    uint64_t driver_waits;     /* times the host blocked waiting on the device */
+    uint64_t driver_waits;     /* times the host had to wait on the device     */
+    uint64_t waits_spun;       /* ... satisfied while spinning                 */
+    uint64_t waits_blocked;    /* ... after sleeping for an interrupt          */
+    uint64_t wake_latency_ns;  /* summed over blocked waits: retire -> awake   */
     uint64_t driver_stalls;    /* times submission blocked on a full queue     */
     uint64_t staging_waits;    /* times the host blocked for a staging slot    */
     uint64_t bytes_h2d;
@@ -111,6 +115,16 @@ sgError_t sgGemmF32(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, 
 sgError_t sgVaddF32Async(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t n, sgStream_t stream);
 sgError_t sgGemmF32Async(sgDevPtr c, sgDevPtr a, sgDevPtr b, uint32_t m, uint32_t n, uint32_t k,
                          sgStream_t stream);
+
+/*
+ * How host-side waits (sgDeviceSynchronize, sgStreamSynchronize,
+ * sgEventSynchronize, synchronous copies) behave, like cudaSetDeviceFlags'
+ * schedule modes. DEFAULT defers to the driver's policy (spin, block, hybrid
+ * or adaptive); SPIN never sleeps (lowest latency, a core per waiter); BLOCK
+ * sleeps until the device's interrupt (lowest CPU, wake-up latency added).
+ */
+typedef enum sgSyncPolicy { SG_SYNC_DEFAULT = 0, SG_SYNC_SPIN = 1, SG_SYNC_BLOCK = 2 } sgSyncPolicy_t;
+sgError_t sgSetSyncPolicy(sgSyncPolicy_t policy);
 
 /* Wait for all submitted work on every stream and engine to finish. */
 sgError_t sgDeviceSynchronize(void);

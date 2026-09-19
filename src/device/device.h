@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/event.h"
 #include "softgpu/sg_ioctl.h"
 
 namespace softgpu::device {
@@ -44,6 +45,14 @@ struct alignas(64) Channel {
     // ---- engine -> driver -------------------------------------------------
     alignas(64) std::atomic<uint64_t> get{0};
     std::atomic<int32_t> sticky_error{0}; // first -errno since reset, or 0
+
+    // ---- interrupt --------------------------------------------------------
+    // STAGE 2: the driver arms an interrupt for a fence value ("tell me when
+    // get >= irq_target"); the engine clears it and pulses the device's IRQ
+    // line when the fence passes. 0 = disarmed. last_irq_cycles is when it
+    // fired, so a woken waiter can measure its wake-up latency.
+    alignas(64) std::atomic<uint64_t> irq_target{0};
+    std::atomic<uint64_t> last_irq_cycles{0};
 };
 
 // One engine's telemetry (the engine thread accounts across its channels).
@@ -53,6 +62,7 @@ struct alignas(64) EngineStats {
     std::atomic<uint64_t> idle_cycles{0}; // nothing queued on any channel
     std::atomic<uint64_t> cmds_executed{0};
     std::atomic<uint64_t> batches{0};   // idle -> busy transitions
+    std::atomic<uint64_t> irqs{0};      // interrupts raised
     std::atomic<uint32_t> stats_gen{0}; // bumped by reset_stats(); engine restarts its idle timer
 };
 
@@ -68,6 +78,13 @@ public:
     uint32_t num_channels() const { return num_channels_; }
     Channel& channel(uint32_t engine, uint32_t ch) { return ch_[engine][ch]; }
     EngineStats& stats(uint32_t engine) { return stats_[engine]; }
+    // The device's single interrupt line (one MSI): every armed channel
+    // pulses it; the "ISR" on the driver side works out which fence fired.
+    Event& irq() { return irq_; }
+    // When the IRQ line last pulsed (device cycles); waiters use it to
+    // measure their wake-up latency.
+    uint64_t last_irq_cycles() const { return last_irq_.load(std::memory_order_relaxed); }
+    void note_irq(uint64_t t) { last_irq_.store(t, std::memory_order_relaxed); }
     uint64_t vram_size() const { return vram_size_; }
 
     // Bring the engines up / down. power_off() blocks until every engine
@@ -85,6 +102,8 @@ private:
 
     Channel ch_[SG_MAX_ENGINES][SG_MAX_CHANNELS];
     EngineStats stats_[SG_MAX_ENGINES];
+    Event irq_;
+    std::atomic<uint64_t> last_irq_{0};
     uint32_t num_engines_;
     uint32_t num_channels_;
     std::unique_ptr<uint8_t[]> vram_;

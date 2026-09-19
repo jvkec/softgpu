@@ -9,6 +9,7 @@
 #include <cstring>
 #include <numeric>
 #include <thread>
+#include <time.h>
 #include <vector>
 
 #include "softgpu/sg_runtime.h"
@@ -512,6 +513,76 @@ static void test_concurrent_streams() {
     CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
 }
 
+// ---- stage 2: wait policy ---------------------------------------------------
+
+static void test_wait_policy_stats() {
+    // A 14 ms GEMM synchronized under each policy: blocking must sleep (one
+    // blocked wait, tiny CPU), spinning must not (one spun wait, cpu ~ wall).
+    const uint32_t d = 512;
+    const size_t bytes = size_t(d) * d * 4;
+    sgDevPtr a = 0, b = 0, c = 0;
+    CHECK_OK(sgMalloc(&a, bytes)); CHECK_OK(sgMalloc(&b, bytes)); CHECK_OK(sgMalloc(&c, bytes));
+    CHECK_OK(sgMemset(a, 0, bytes)); CHECK_OK(sgMemset(b, 0, bytes)); CHECK_OK(sgDeviceSynchronize());
+    auto cpu_ns = [] {
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        return double(ts.tv_sec) * 1e9 + double(ts.tv_nsec);
+    };
+    for (int pol = 0; pol < 2; ++pol) {
+        CHECK_OK(sgSetSyncPolicy(pol == 0 ? SG_SYNC_BLOCK : SG_SYNC_SPIN));
+        sgStats_t s0{}, s1{};
+        CHECK_OK(sgResetStats());
+        CHECK_OK(sgGetStats(&s0));
+        CHECK_OK(sgGemmF32(c, a, b, d, d, d));
+        const double c0 = cpu_ns();
+        auto t0 = std::chrono::steady_clock::now();
+        CHECK_OK(sgDeviceSynchronize());
+        const double wall = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+        const double cpu = cpu_ns() - c0;
+        CHECK_OK(sgGetStats(&s1));
+        CHECK(s1.driver_waits - s0.driver_waits == 1);
+        if (pol == 0) {
+            CHECK(s1.waits_blocked - s0.waits_blocked == 1);
+            CHECK(cpu < 0.2 * wall); // slept most of the time
+            CHECK(s1.engine_irqs[0] - s0.engine_irqs[0] >= 1);
+        } else {
+            CHECK(s1.waits_spun - s0.waits_spun == 1);
+            CHECK(cpu > 0.8 * wall); // spun the whole time
+        }
+    }
+    CHECK_OK(sgSetSyncPolicy(SG_SYNC_DEFAULT));
+    CHECK_OK(sgFree(a)); CHECK_OK(sgFree(b)); CHECK_OK(sgFree(c));
+}
+
+static void test_blocking_lost_wakeup_stress() {
+    // Many tiny waits under the blocking policy from several threads. Each
+    // wait arms an interrupt for a fence that is often already about to
+    // retire — the exact window a lost-wakeup bug would hang in. The ctest
+    // TIMEOUT is the assertion; here we just check results.
+    CHECK_OK(sgSetSyncPolicy(SG_SYNC_BLOCK));
+    const int T = 8, iters = 2000;
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, &bad] {
+            sgStream_t s = nullptr;
+            sgDevPtr d = 0;
+            uint8_t* h = nullptr;
+            if (sgStreamCreate(&s) != SG_OK || sgMalloc(&d, 4096) != SG_OK ||
+                sgMallocHost(reinterpret_cast<void**>(&h), 4096) != SG_OK) { bad[t] = 1; return; }
+            for (int i = 0; i < iters && !bad[t]; ++i) {
+                if (sgMemsetAsync(d, i & 0xff, 4096, s) != SG_OK ||
+                    sgMemcpyD2HAsync(h, d, 4096, s) != SG_OK || sgStreamSynchronize(s) != SG_OK ||
+                    h[0] != uint8_t(i & 0xff) || h[4095] != uint8_t(i & 0xff))
+                    bad[t] = 1;
+            }
+            sgFreeHost(h); sgFree(d); sgStreamDestroy(s);
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+    CHECK_OK(sgSetSyncPolicy(SG_SYNC_DEFAULT));
+}
+
 static void test_concurrent_submitters() {
     // Many threads hammering the driver; every thread verifies its own data.
     const int T = 8, iters = 200;
@@ -560,6 +631,8 @@ int main() {
         {"pageable_on_streams_and_deferred_copy_free", test_pageable_on_streams_and_deferred_copy_free},
         {"engine_rejections", test_engine_rejections},
         {"concurrent_streams", test_concurrent_streams},
+        {"wait_policy_stats", test_wait_policy_stats},
+        {"blocking_lost_wakeup_stress", test_blocking_lost_wakeup_stress},
         {"concurrent_submitters", test_concurrent_submitters},
     };
     for (auto& t : tests) {

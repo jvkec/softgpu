@@ -64,3 +64,10 @@ set_tests_properties(runtime_staging1 PROPERTIES ENVIRONMENT "SG_STAGING_SLOTS=1
 # exercised between copy engines as well as against compute.
 add_test(NAME runtime_ce2 COMMAND sgtest)
 set_tests_properties(runtime_ce2 PROPERTIES ENVIRONMENT "SG_COPY_ENGINES=2")
+# Wait policies: correctness must not depend on how the host waits. A hang
+# here is the classic lost-wakeup race, hence the timeouts.
+add_test(NAME runtime_block COMMAND sgtest)
+set_tests_properties(runtime_block PROPERTIES ENVIRONMENT "SG_WAIT_POLICY=block" TIMEOUT 120)
+add_test(NAME runtime_adaptive COMMAND sgtest)
+set_tests_properties(runtime_adaptive PROPERTIES ENVIRONMENT "SG_WAIT_POLICY=adaptive" TIMEOUT 120)
+set_tests_properties(runtime runtime_ring2 runtime_staging1 runtime_ce2 PROPERTIES TIMEOUT 120)

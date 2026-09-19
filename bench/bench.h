@@ -112,6 +112,8 @@ struct Window {
     double dev_cmds() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += cmds(e); return n; }
     double dev_batches() const { double n = 0; for (uint32_t e = 0; e < engines(); ++e) n += batches(e); return n; }
     double waits() const { return double(s1.driver_waits - s0.driver_waits); }
+    double waits_blocked() const { return double(s1.waits_blocked - s0.waits_blocked); }
+    double wake_ns() const { return double(s1.wake_latency_ns - s0.wake_latency_ns); }
     double stalls() const { return double(s1.driver_stalls - s0.driver_stalls); }
     double staging_waits() const { return double(s1.staging_waits - s0.staging_waits); }
     double bytes_direct() const { return double(s1.bytes_direct - s0.bytes_direct); }
@@ -121,6 +123,9 @@ struct Window {
     void fill(Row& r, double ops) const {
         r.metrics["wall_ms"] = wall_ns() / 1e6;
         r.metrics["cpu_ns_per_op"] = cpu_ns() / ops;
+        r.metrics["cpu_frac"] = cpu_ns() / std::max(1.0, wall_ns()); // submitter CPU / wall
+        if (waits() > 0) r.metrics["blocked_frac"] = waits_blocked() / waits();
+        if (waits_blocked() > 0) r.metrics["wake_us"] = wake_ns() / waits_blocked() / 1e3;
         r.metrics["dev_util"] = util(0); // compute engine
         // Copy engines: utilization of the busiest one, and the fraction of
         // its non-idle time spent blocked on a semaphore rather than copying.
@@ -166,5 +171,6 @@ void bench_gemm(const Options&, Report&);
 void bench_mt(const Options&, Report&);
 void bench_alloc(const Options&, Report&);
 void bench_pipeline(const Options&, Report&);
+void bench_wait(const Options&, Report&);
 
 } // namespace bench
