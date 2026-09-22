@@ -478,6 +478,7 @@ sgError_t sgGetStats(sgStats_t* out) {
         out->waits_spun = s.waits_spun;
         out->waits_blocked = s.waits_blocked;
         out->wake_latency_ns = s.wake_latency_ns;
+        out->lock_wait_ns = s.lock_wait_ns;
         out->driver_stalls = s.stalls;
         out->staging_waits = s.staging_waits;
         out->bytes_h2d = s.bytes_h2d;

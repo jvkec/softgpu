@@ -103,6 +103,14 @@ void Device::run(uint32_t engine) {
             // makes every slot below it visible to this thread.
             uint64_t put = ch.put.load(std::memory_order_acquire);
             if (put == k.get) continue;
+            if (put < k.get) {
+                // PUT behind GET is a driver bug (a doorbell went backwards).
+                // Real hardware would fault the channel; so do we, rather
+                // than executing whatever is in the ring.
+                int expected = 0;
+                ch.sticky_error.compare_exchange_strong(expected, -EIO, std::memory_order_relaxed);
+                continue;
+            }
             pending = true;
             while (k.get != put) {
                 const sg_cmd& cmd = k.ring[k.get & k.mask];

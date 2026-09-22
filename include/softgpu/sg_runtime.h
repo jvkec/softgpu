@@ -56,6 +56,7 @@ typedef struct sgStats {
     uint64_t waits_spun;       /* ... satisfied while spinning                 */
     uint64_t waits_blocked;    /* ... after sleeping for an interrupt          */
     uint64_t wake_latency_ns;  /* summed over blocked waits: retire -> awake   */
+    uint64_t lock_wait_ns;     /* time submitters spent contended on driver locks */
     uint64_t driver_stalls;    /* times submission blocked on a full queue     */
     uint64_t staging_waits;    /* times the host blocked for a staging slot    */
     uint64_t bytes_h2d;

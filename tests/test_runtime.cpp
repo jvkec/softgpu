@@ -583,6 +583,134 @@ static void test_blocking_lost_wakeup_stress() {
     CHECK_OK(sgSetSyncPolicy(SG_SYNC_DEFAULT));
 }
 
+// ---- stage 4: no big lock -------------------------------------------------
+
+static void test_shared_stream_many_producers() {
+    // 8 threads submit to ONE stream (hence one channel), each on its own
+    // device buffer: memset(value) then D2H. Stream order must hold for each
+    // thread's own pair regardless of how producers interleave.
+    const int T = 8, iters = 500;
+    sgStream_t s = nullptr;
+    CHECK_OK(sgStreamCreate(&s));
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, s, &bad] {
+            sgDevPtr d = 0;
+            uint8_t* h = nullptr;
+            if (sgMalloc(&d, 4096) != SG_OK || sgMallocHost(reinterpret_cast<void**>(&h), 4096) != SG_OK) { bad[t] = 1; return; }
+            for (int i = 0; i < iters && !bad[t]; ++i) {
+                const uint8_t v = uint8_t(t * 32 + (i & 31));
+                if (sgMemsetAsync(d, v, 4096, s) != SG_OK || sgMemcpyD2HAsync(h, d, 4096, s) != SG_OK ||
+                    sgStreamSynchronize(s) != SG_OK || h[0] != v || h[4095] != v)
+                    bad[t] = 1;
+            }
+            sgFreeHost(h); sgFree(d);
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+    CHECK_OK(sgStreamDestroy(s));
+}
+
+static void test_alloc_storm_during_submits() {
+    // Half the threads allocate/free continuously, half run pinned copy
+    // chains on their own streams; validation must never see a torn
+    // allocator and no thread may observe another's memory.
+    const int T = 8, iters = 300;
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, &bad] {
+            if (t % 2 == 0) {
+                for (int i = 0; i < iters * 4 && !bad[t]; ++i) {
+                    sgDevPtr p = 0;
+                    if (sgMalloc(&p, 4096 << (i % 6)) != SG_OK) { bad[t] = 1; break; }
+                    if (sgMemsetAsync(p, i, 4096, nullptr) != SG_OK) { bad[t] = 1; break; }
+                    if (sgFree(p) != SG_OK) { bad[t] = 1; break; }
+                }
+            } else {
+                sgStream_t s = nullptr;
+                sgDevPtr d = 0;
+                uint8_t *src = nullptr, *dst = nullptr;
+                if (sgStreamCreate(&s) != SG_OK || sgMalloc(&d, 65536) != SG_OK ||
+                    sgMallocHost(reinterpret_cast<void**>(&src), 65536) != SG_OK ||
+                    sgMallocHost(reinterpret_cast<void**>(&dst), 65536) != SG_OK) { bad[t] = 1; return; }
+                for (int i = 0; i < iters && !bad[t]; ++i) {
+                    std::memset(src, t + i, 65536);
+                    if (sgMemcpyH2DAsync(d, src, 65536, s) != SG_OK || sgMemcpyD2HAsync(dst, d, 65536, s) != SG_OK ||
+                        sgStreamSynchronize(s) != SG_OK || std::memcmp(src, dst, 65536) != 0)
+                        bad[t] = 1;
+                }
+                sgFreeHost(src); sgFreeHost(dst); sgFree(d); sgStreamDestroy(s);
+            }
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+    CHECK_OK(sgDeviceSynchronize());
+}
+
+static void test_pin_storm_during_copies() {
+    // Threads register/unregister ranges while others copy from pinned
+    // memory; a copy must be either fully direct or fully staged, never a
+    // mix that reads a range mid-unpin.
+    const int T = 6, iters = 200;
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, &bad] {
+            std::vector<uint8_t> buf(1 << 16), out(1 << 16);
+            sgDevPtr d = 0;
+            if (sgMalloc(&d, buf.size()) != SG_OK) { bad[t] = 1; return; }
+            for (int i = 0; i < iters && !bad[t]; ++i) {
+                std::fill(buf.begin(), buf.end(), uint8_t(t + i));
+                const bool pin = (i % 3) != 0;
+                if (pin && sgHostRegister(buf.data(), buf.size()) != SG_OK) { bad[t] = 1; break; }
+                if (sgMemcpyH2D(d, buf.data(), buf.size()) != SG_OK || sgMemcpyD2H(out.data(), d, buf.size()) != SG_OK ||
+                    out != buf)
+                    bad[t] = 1;
+                if (pin && sgHostUnregister(buf.data()) != SG_OK) bad[t] = 1;
+            }
+            sgDeviceSynchronize();
+            sgFree(d);
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+}
+
+static void test_ticket_publish_storm() {
+    // Two producers per channel (16 streams over 8 channels), each thread
+    // alternating between its two streams, hammering tiny commands. In
+    // ticket mode this is the interleaving that regressed the device's PUT
+    // in the first cut and hung the engine; the test must terminate and
+    // every thread must read back its own values.
+    const int T = 8, iters = 3000;
+    std::vector<sgStream_t> streams(2 * T);
+    for (auto& s : streams) CHECK_OK(sgStreamCreate(&s));
+    std::vector<std::thread> ts;
+    std::vector<int> bad(T, 0);
+    for (int t = 0; t < T; ++t)
+        ts.emplace_back([t, &streams, &bad] {
+            sgDevPtr d[2] = {0, 0};
+            uint8_t* h[2] = {nullptr, nullptr};
+            for (int k = 0; k < 2; ++k)
+                if (sgMalloc(&d[k], 4096) != SG_OK || sgMallocHost(reinterpret_cast<void**>(&h[k]), 4096) != SG_OK) { bad[t] = 1; return; }
+            for (int i = 0; i < iters && !bad[t]; ++i) {
+                const int k = i & 1;
+                sgStream_t s = streams[t * 2 + k];
+                const uint8_t v = uint8_t(t * 8 + (i & 7));
+                if (sgMemsetAsync(d[k], v, 4096, s) != SG_OK || sgMemcpyD2HAsync(h[k], d[k], 4096, s) != SG_OK) bad[t] = 1;
+                if (i % 16 == 15 && (sgStreamSynchronize(s) != SG_OK || h[k][0] != v || h[k][4095] != v)) bad[t] = 1;
+            }
+            for (int k = 0; k < 2; ++k) { sgStreamSynchronize(streams[t * 2 + k]); sgFreeHost(h[k]); sgFree(d[k]); }
+        });
+    for (auto& th : ts) th.join();
+    CHECK(std::accumulate(bad.begin(), bad.end(), 0) == 0);
+    sgStats_t st{};
+    CHECK_OK(sgGetStats(&st));
+    for (auto& s : streams) CHECK_OK(sgStreamDestroy(s));
+    CHECK_OK(sgDeviceSynchronize()); // would report the sticky error if PUT ever regressed
+}
+
 static void test_concurrent_submitters() {
     // Many threads hammering the driver; every thread verifies its own data.
     const int T = 8, iters = 200;
@@ -633,6 +761,10 @@ int main() {
         {"concurrent_streams", test_concurrent_streams},
         {"wait_policy_stats", test_wait_policy_stats},
         {"blocking_lost_wakeup_stress", test_blocking_lost_wakeup_stress},
+        {"shared_stream_many_producers", test_shared_stream_many_producers},
+        {"alloc_storm_during_submits", test_alloc_storm_during_submits},
+        {"pin_storm_during_copies", test_pin_storm_during_copies},
+        {"ticket_publish_storm", test_ticket_publish_storm},
         {"concurrent_submitters", test_concurrent_submitters},
     };
     for (auto& t : tests) {

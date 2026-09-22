@@ -1,26 +1,24 @@
-// STAGE 2 (built after 3b): interrupts and a wait policy. Every place the
-// host used to spin on a fence register now goes through wait_until(): spin
-// for a budget, then arm the channel's interrupt and sleep on the device's
-// IRQ line until it fires. SG_WAIT_POLICY selects spin / block / hybrid /
-// adaptive; per-call flags can force spin or block.
+// STAGE 4 (built after 2): no big lock. Submission holds only its channel's
+// lock (or, in ticket mode, no lock at all); the shared structures behind it
+// — VRAM allocator and deferred-release list, pin registry, staging pool —
+// each have a small lock of their own, and every counter is atomic. PUT
+// mirrors are atomics so snapshots ("everything submitted so far") need no
+// lock either.
 //
-// STAGE 3b driver: engines, channels, cross-channel fences.
+// Lock order, where two are ever held: pin_lock -> alloc_lock (UNPIN pushes
+// onto the pending list). Channel locks nest inside nothing and nothing
+// nests inside them except the staging lock (briefly, for slot bookkeeping).
 //
-// What changed from stage 3a:
-//   * the device has a compute engine and one or more copy engines, each
-//     serving several channels (rings) with their own fence counters; SUBMIT
-//     names the (engine, channel);
-//   * SG_OP_WAIT_FENCE lets a channel block on another channel's fence, which
-//     is how the runtime keeps a stream in order across engines;
-//   * every fence the driver stores — staging slot reuse, deferred frees and
-//     unpins — is now (engine, channel, value), or a snapshot of every
-//     channel's PUT; SG_IOC_WAIT with SG_WAIT_ALL waits on such a snapshot.
+// STAGE 2: interrupts and a wait policy. Every place the host waits for a
+// fence goes through wait_until(): spin for a budget, then arm the channel's
+// interrupt and sleep on the device's IRQ line until it fires.
 //
-// Still deliberately unchanged: the big driver lock, spinning as the wait
-// mechanism, the staging pool geometry, the VRAM allocator.
+// STAGE 3b: engines, channels, cross-channel fences. SUBMIT names the
+// (engine, channel); SG_OP_WAIT_FENCE lets a channel block on another's
+// fence; every stored fence is (engine, channel, value) or a PUT snapshot.
 //
 // Deadlock freedom: a WAIT_FENCE is accepted only if its target value is
-// <= that engine's PUT at submission time, i.e. the command it waits for was
+// <= that channel's PUT at submission time, i.e. the command it waits for was
 // enqueued before the WAIT itself. By induction on enqueue order the
 // dependency graph is a DAG, so no engine can wait on something behind it.
 
@@ -34,6 +32,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
+#include <thread>
 #include <vector>
 
 #include "common/clock.h"
@@ -77,6 +77,10 @@ uint32_t policy_from_env() {
     if (!std::strcmp(e, "hybrid")) return SG_POLICY_HYBRID;
     return SG_POLICY_ADAPTIVE;
 }
+uint32_t submit_mode_from_env() {
+    const char* e = std::getenv("SG_SUBMIT_MODE");
+    return (e && !std::strcmp(e, "ticket")) ? SG_SUBMIT_TICKET : SG_SUBMIT_MUTEX;
+}
 // SG_DEVICE_CPU=<n> pins the compute engine's thread; -1 (default) leaves it to the OS.
 int device_cpu_from_env() {
     const char* e = std::getenv("SG_DEVICE_CPU");
@@ -103,44 +107,64 @@ struct Pending {
     PutSnapshot fence;
 };
 
+// Per-channel producer state, on its own cache line.
+struct alignas(64) Producer {
+    std::mutex lock;                 // SG_SUBMIT_MUTEX: one producer at a time
+    std::atomic<uint64_t> reserve{0}; // SG_SUBMIT_TICKET: next slot to claim
+    std::atomic<uint64_t> put{0};    // driver-side mirror of the PUT register
+};
+
+struct Slot {
+    Fence fence;       // DMA that last used the slot; reuse once retired
+    bool busy = false; // acquired by a copy in progress
+};
+
 struct Driver {
-    std::mutex lock; // still the big driver lock; stage 4 breaks it up
     uint32_t num_engines = 0;
     uint32_t num_channels = 0;
+    uint32_t submit_mode = SG_SUBMIT_MUTEX;
     device::Device dev{SG_VRAM_SIZE, copy_engines_from_env(), channels_from_env()};
-    VramAllocator vram{SG_VRAM_SIZE, SG_ALLOC_ALIGN};
 
     std::unique_ptr<sg_cmd, FreeDeleter> ring[SG_MAX_ENGINES][SG_MAX_CHANNELS];
     uint32_t depth = 0;
-    PutSnapshot put = {}; // driver-side mirrors of the PUT registers
+    Producer prod[SG_MAX_ENGINES][SG_MAX_CHANNELS];
 
-    // Staging pool for pageable copies: `slots` chunks of `chunk` bytes, each
-    // reusable once the DMA that last used it (slot_fence) has retired.
+    // VRAM allocator and the deferred-release list share one lock; the
+    // submit path only reads (owns_range) and takes it shared.
+    std::shared_mutex alloc_lock;
+    VramAllocator vram{SG_VRAM_SIZE, SG_ALLOC_ALIGN};
+    std::vector<Pending> pending;
+
+    // Pinned host ranges: looked up on every copy submit (shared), changed
+    // rarely (exclusive).
+    std::shared_mutex pin_lock;
+    std::map<uint64_t, uint64_t> pins; // addr -> size
+
+    // Staging pool for pageable copies: `slots` chunks of `chunk` bytes. The
+    // lock covers slot bookkeeping only; the memcpy and the wait happen
+    // outside it.
+    std::mutex staging_lock;
     std::vector<uint8_t> staging;
-    std::vector<Fence> slot_fence;
+    std::vector<Slot> slot;
     uint32_t slots = 0;
     uint64_t chunk = 0;
-    uint32_t next_slot = 0; // rotates across submissions, not just within one
+    uint32_t next_slot = 0;
 
-    std::map<uint64_t, uint64_t> pins; // pinned host ranges: addr -> size
-    std::vector<Pending> pending;      // deferred frees / unpins
-
-    // Wait policy. The counters and the adaptive estimators are touched by
-    // SG_IOC_WAIT, which runs without the driver lock by design (a thread
-    // synchronizing must not block submitters), so they are atomic.
+    // Wait policy (ADR 004).
     uint32_t policy = SG_POLICY_ADAPTIVE;
     uint64_t spin_ns = kDefaultSpinNs;
-    std::atomic<uint64_t> waits{0}, waits_spun{0}, waits_blocked{0}, wake_latency_ns{0};
-    // Adaptive: EWMA (ns) of recent total wait durations, per channel and
-    // for SG_WAIT_ALL. A channel whose waits are long gets a short spin.
     std::atomic<uint64_t> ewma[SG_MAX_ENGINES][SG_MAX_CHANNELS] = {};
     std::atomic<uint64_t> ewma_all{0};
-    uint64_t submits = 0, stalls = 0, staging_waits = 0;
-    uint64_t bytes_h2d = 0, bytes_d2h = 0, bytes_direct = 0, bytes_staged = 0;
+
+    // Counters: all atomic, all relaxed; nothing here needs a lock.
+    std::atomic<uint64_t> waits{0}, waits_spun{0}, waits_blocked{0}, wake_latency_ns{0};
+    std::atomic<uint64_t> submits{0}, stalls{0}, staging_waits{0}, lock_wait_ns{0};
+    std::atomic<uint64_t> bytes_h2d{0}, bytes_d2h{0}, bytes_direct{0}, bytes_staged{0};
 
     Driver() {
         num_engines = dev.num_engines();
         num_channels = dev.num_channels();
+        submit_mode = submit_mode_from_env();
         depth = ring_depth_from_env();
         for (uint32_t e = 0; e < num_engines; ++e)
             for (uint32_t c = 0; c < num_channels; ++c) {
@@ -154,17 +178,51 @@ struct Driver {
         slots = staging_slots_from_env();
         chunk = staging_chunk_from_env();
         staging.assign(size_t{slots} * chunk, 0);
-        slot_fence.assign(slots, Fence{});
+        slot.assign(slots, Slot{});
         policy = policy_from_env();
         spin_ns = spin_ns_from_env();
     }
 
-    uint8_t* slot(uint32_t i) { return staging.data() + size_t{i} * chunk; }
+    uint8_t* slot_ptr(uint32_t i) { return staging.data() + size_t{i} * chunk; }
 };
 
 std::mutex g_open_lock;
 std::unique_ptr<Driver> g_drv;
 int g_refs = 0;
+
+// ---- locks with contention accounting ----------------------------------------
+// The uncontended path is a plain try_lock; only a contended acquisition
+// reads the clock, so `lock_wait_ns` is the cost of contention and nothing else.
+template <class M>
+void lock_timed(Driver& d, M& m) {
+    if (m.try_lock()) return;
+    const uint64_t t0 = now_cycles();
+    m.lock();
+    d.lock_wait_ns.fetch_add(now_cycles() - t0, std::memory_order_relaxed);
+}
+void lock_shared_timed(Driver& d, std::shared_mutex& m) {
+    if (m.try_lock_shared()) return;
+    const uint64_t t0 = now_cycles();
+    m.lock_shared();
+    d.lock_wait_ns.fetch_add(now_cycles() - t0, std::memory_order_relaxed);
+}
+struct Guard {
+    Driver& d; std::mutex& m;
+    Guard(Driver& d_, std::mutex& m_) : d(d_), m(m_) { lock_timed(d, m); }
+    ~Guard() { m.unlock(); }
+};
+struct SharedGuard {
+    std::shared_mutex& m;
+    SharedGuard(Driver& d, std::shared_mutex& m_) : m(m_) { lock_shared_timed(d, m); }
+    ~SharedGuard() { m.unlock_shared(); }
+};
+struct ExclusiveGuard {
+    std::shared_mutex& m;
+    ExclusiveGuard(Driver& d, std::shared_mutex& m_) : m(m_) { lock_timed(d, m); }
+    ~ExclusiveGuard() { m.unlock(); }
+};
+
+// ---- fences and waiting --------------------------------------------------------
 
 inline int sticky(Driver& d) {
     for (uint32_t e = 0; e < d.num_engines; ++e)
@@ -174,6 +232,9 @@ inline int sticky(Driver& d) {
 }
 inline uint64_t retired(Driver& d, uint32_t e, uint32_t c) {
     return d.dev.channel(e, c).get.load(std::memory_order_acquire);
+}
+inline uint64_t published(Driver& d, uint32_t e, uint32_t c) {
+    return d.prod[e][c].put.load(std::memory_order_acquire);
 }
 
 // Arm the interrupt on a channel for `target`, keeping the lowest armed
@@ -186,7 +247,7 @@ void arm_irq(Driver& d, uint32_t e, uint32_t c, uint64_t target) {
            !t.compare_exchange_weak(cur, target, std::memory_order_release, std::memory_order_relaxed)) {}
 }
 
-constexpr uint64_t kMinSpinNs = 200;       // always spin at least one round trip
+constexpr uint64_t kMinSpinNs = 200;        // always spin at least one round trip
 constexpr uint64_t kAdaptiveFloorNs = 2000; // adaptive never predicts below this: cheap insurance
                                             // against blocking (and a 30 us wake) on sub-us chains
 constexpr uint64_t kBlockTimeoutNs = 1000000; // safety net: re-check every 1 ms even without an IRQ
@@ -214,7 +275,7 @@ int wait_until(Driver& d, Pred pred, Arm arm, uint32_t flags, std::atomic<uint64
     case SG_POLICY_ADAPTIVE: {
         // Expect this wait to look like recent ones: spin for about twice
         // the typical wait if that fits the cap, otherwise go straight to
-        // sleep (after the minimum spin that catches nearly-done fences).
+        // sleep after the floor.
         const uint64_t typical = ewma ? ewma->load(std::memory_order_relaxed) : 0;
         budget = typical == 0 ? d.spin_ns
                : typical > d.spin_ns ? kAdaptiveFloorNs
@@ -254,11 +315,8 @@ int wait_until(Driver& d, Pred pred, Arm arm, uint32_t flags, std::atomic<uint64
             if (pred()) break;
         }
     }
-    // Only the adaptive policy needs to know how long this took; the other
-    // policies never pay for a clock read on a wait that ends in the first
-    // spin round. A wait that ended before t0 was taken counts as ~one round.
-    //
-    // For a blocked wait, measure until the fence *passed* (the interrupt
+    // Only the adaptive policy needs to know how long this took. For a
+    // blocked wait, measure until the fence *passed* (the interrupt
     // timestamp), not until this thread woke: the wake-up latency is the
     // policy's own penalty, and feeding it back into the estimate makes one
     // blocked wait predict "long" forever — the first version of this code
@@ -283,22 +341,23 @@ void note_wake(Driver& d) {
 }
 
 // Block until (engine, channel) has retired everything up to `value`.
-int wait_fence(Driver& d, Fence f, uint64_t* counter = nullptr, uint32_t flags = SG_WAIT_DEFAULT) {
-    auto& ch = d.dev.channel(f.engine, f.channel);
+int wait_fence(Driver& d, Fence f, std::atomic<uint64_t>* counter = nullptr,
+               uint32_t flags = SG_WAIT_DEFAULT) {
     const int r = wait_until(
         d, [&] { return retired(d, f.engine, f.channel) >= f.value; },
         [&] { arm_irq(d, f.engine, f.channel, f.value); }, flags, &d.ewma[f.engine][f.channel]);
-    (void)ch;
     if (r == kBlocked) note_wake(d);
-    if (r != kNoWait) {
-        if (counter) ++*counter; // a staging-slot wait, accounted separately
-        else d.waits.fetch_add(1, std::memory_order_relaxed);
-    }
+    if (r != kNoWait) (counter ? *counter : d.waits).fetch_add(1, std::memory_order_relaxed);
     return sticky(d) ? -EIO : 0;
 }
 
+// Snapshot of every channel's PUT. Lock-free: monotonic counters read one at
+// a time give "at least everything whose submit had returned before now",
+// which is exactly what "everything submitted so far" promises.
 void snapshot_puts(Driver& d, PutSnapshot out) {
-    std::memcpy(out, d.put, sizeof(PutSnapshot));
+    for (uint32_t e = 0; e < SG_MAX_ENGINES; ++e)
+        for (uint32_t c = 0; c < SG_MAX_CHANNELS; ++c)
+            out[e][c] = (e < d.num_engines && c < d.num_channels) ? published(d, e, c) : 0;
 }
 bool all_retired(Driver& d, const PutSnapshot fence) {
     for (uint32_t e = 0; e < d.num_engines; ++e)
@@ -307,8 +366,7 @@ bool all_retired(Driver& d, const PutSnapshot fence) {
     return true;
 }
 
-// Block until every channel has retired a PUT snapshot. Lock-free; the
-// snapshot itself must have been taken under the lock.
+// Block until every channel has retired a PUT snapshot.
 int wait_snapshot(Driver& d, const PutSnapshot fence, uint32_t flags = SG_WAIT_DEFAULT) {
     const int r = wait_until(
         d, [&] { return all_retired(d, fence); },
@@ -323,34 +381,60 @@ int wait_snapshot(Driver& d, const PutSnapshot fence, uint32_t flags = SG_WAIT_D
     return sticky(d) ? -EIO : 0;
 }
 
-// Wait for everything submitted so far. Caller holds d.lock.
+// Wait for everything submitted so far.
 int drain(Driver& d) {
     PutSnapshot snap;
     snapshot_puts(d, snap);
     return wait_snapshot(d, snap);
 }
 
+// ---- submission ------------------------------------------------------------------
+
 // Append one command to a channel's ring and ring its doorbell. Returns the
-// fence. Caller holds d.lock, which makes the driver each ring's single
-// producer.
+// fence. In mutex mode the caller holds the channel's lock and is the single
+// producer. In ticket mode any number of producers race: each claims a slot
+// with fetch_add, writes it, then publishes in ticket order — waiting for
+// the previous ticket's publish, since PUT must advance contiguously.
 uint64_t enqueue(Driver& d, uint32_t engine, uint32_t channel, const sg_cmd& cmd) {
-    auto& c = d.dev.channel(engine, channel);
-    uint64_t& put = d.put[engine][channel];
-    if (put - retired(d, engine, channel) >= d.depth) {
-        ++d.stalls;
-        // Full ring: wait for the oldest in-flight command on this channel.
-        const uint64_t need = put - d.depth + 1;
+    Producer& p = d.prod[engine][channel];
+    auto& regs = d.dev.channel(engine, channel);
+    uint64_t slot;
+    if (d.submit_mode == SG_SUBMIT_TICKET) {
+        slot = p.reserve.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        slot = p.put.load(std::memory_order_relaxed);
+    }
+    // Backpressure: the slot we are about to write must have been retired.
+    if (slot - retired(d, engine, channel) >= d.depth) {
+        d.stalls.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t need = slot - d.depth + 1;
         wait_until(d, [&] { return retired(d, engine, channel) >= need; },
                    [&] { arm_irq(d, engine, channel, need); }, SG_WAIT_DEFAULT, nullptr);
     }
-    d.ring[engine][channel].get()[put & (d.depth - 1)] = cmd;
-    ++put;
-    c.put.store(put, std::memory_order_release); // release: slot before doorbell
-    return put;
+    d.ring[engine][channel].get()[slot & (d.depth - 1)] = cmd;
+    if (d.submit_mode == SG_SUBMIT_TICKET) {
+        // Publish in order. The hazard is the classic one: a producer
+        // descheduled between reserve and here holds up everyone behind it —
+        // and if the waiters spin, they are what keeps it descheduled. With
+        // more producers than cores a pure spin here livelocked for good
+        // (ADR 005); after a short spin, yield so the head ticket can run.
+        for (int i = 0; p.put.load(std::memory_order_acquire) != slot; ++i) {
+            if (i < 256) cpu_relax();
+            else std::this_thread::yield();
+        }
+    }
+    // Doorbell first, then hand the ticket on. The first version did these
+    // in the other order and the next producer could ring its doorbell
+    // before ours landed, so the device's PUT went backwards and the engine
+    // ran off the end of the ring forever (ADR 005). Every access here is
+    // atomic, so TSan had nothing to say; the hang did.
+    regs.put.store(slot + 1, std::memory_order_release); // release: slot before doorbell
+    p.put.store(slot + 1, std::memory_order_release);
+    return slot + 1;
 }
 
-// Recycle everything the device has finished with.
-void reclaim(Driver& d) {
+// Recycle everything the device has finished with. Caller holds alloc_lock.
+void reclaim_locked(Driver& d) {
     if (d.pending.empty()) return;
     auto keep = d.pending.begin();
     for (auto& p : d.pending) {
@@ -365,12 +449,43 @@ void reclaim(Driver& d) {
     d.pending.erase(keep, d.pending.end());
 }
 
+bool owns(Driver& d, uint64_t addr, uint64_t len) {
+    SharedGuard g(d, d.alloc_lock);
+    return d.vram.owns_range(addr, len);
+}
+
 // Is [addr, addr+size) entirely inside one pinned range?
-bool pinned(const Driver& d, uint64_t addr, uint64_t size) {
+bool pinned(Driver& d, uint64_t addr, uint64_t size) {
+    SharedGuard g(d, d.pin_lock);
     auto it = d.pins.upper_bound(addr);
     if (it == d.pins.begin()) return false;
     --it;
     return addr - it->first <= it->second && size <= it->second - (addr - it->first);
+}
+
+// Staging slots. acquire marks a free slot busy and hands back the fence its
+// previous user left; the caller waits for that fence *outside* the lock.
+uint32_t acquire_slot(Driver& d, Fence* prev) {
+    for (;;) {
+        {
+            Guard g(d, d.staging_lock);
+            for (uint32_t i = 0; i < d.slots; ++i) {
+                const uint32_t s = (d.next_slot + i) % d.slots;
+                if (!d.slot[s].busy) {
+                    d.slot[s].busy = true;
+                    d.next_slot = (s + 1) % d.slots;
+                    *prev = d.slot[s].fence;
+                    return s;
+                }
+            }
+        }
+        cpu_relax(); // more concurrent pageable copies than slots: rare
+    }
+}
+void release_slot(Driver& d, uint32_t s, Fence f) {
+    Guard g(d, d.staging_lock);
+    d.slot[s].fence = f;
+    d.slot[s].busy = false;
 }
 
 bool is_copy_op(uint32_t op) {
@@ -388,8 +503,23 @@ int do_submit(Driver& d, sg_submit_args& a) {
     // Engine classes: copies only on copy engines, compute only on engine 0.
     if (eng == SG_ENGINE_COMPUTE ? is_copy_op(cmd.opcode) : is_compute_op(cmd.opcode)) return -EINVAL;
     if (sticky(d)) return -EIO;
-    ++d.submits;
+    d.submits.fetch_add(1, std::memory_order_relaxed);
     a.out_flags = 0;
+
+    // Mutex mode: this channel's producers take turns for the whole submit
+    // (all chunks of a copy stay contiguous). Ticket mode: no lock; chunks
+    // from different producers may interleave, which is fine — each stream
+    // only depends on its own commands' relative order.
+    std::unique_lock<std::mutex> chan_guard;
+    if (d.submit_mode == SG_SUBMIT_MUTEX) {
+        Producer& p = d.prod[eng][chn];
+        if (!p.lock.try_lock()) {
+            const uint64_t t0 = now_cycles();
+            p.lock.lock();
+            d.lock_wait_ns.fetch_add(now_cycles() - t0, std::memory_order_relaxed);
+        }
+        chan_guard = std::unique_lock<std::mutex>(p.lock, std::adopt_lock);
+    }
 
     switch (cmd.opcode) {
     case SG_OP_NOP:
@@ -399,26 +529,25 @@ int do_submit(Driver& d, sg_submit_args& a) {
     case SG_OP_WAIT_FENCE:
         // Only fences already published may be waited on (see header note).
         if (cmd.arg0 >= d.num_engines || cmd.arg1 >= d.num_channels ||
-            cmd.src1 > d.put[cmd.arg0][cmd.arg1])
+            cmd.src1 > published(d, cmd.arg0, cmd.arg1))
             return -EINVAL;
         a.fence = enqueue(d, eng, chn, cmd);
         return 0;
 
     case SG_OP_FILL:
-        if (!d.vram.owns_range(cmd.dst, cmd.size)) return -EFAULT;
+        if (!owns(d, cmd.dst, cmd.size)) return -EFAULT;
         a.fence = enqueue(d, eng, chn, cmd);
         return 0;
 
     case SG_OP_COPY_D2D:
-        if (!d.vram.owns_range(cmd.dst, cmd.size) || !d.vram.owns_range(cmd.src0, cmd.size))
-            return -EFAULT;
+        if (!owns(d, cmd.dst, cmd.size) || !owns(d, cmd.src0, cmd.size)) return -EFAULT;
         a.fence = enqueue(d, eng, chn, cmd);
         return 0;
 
     case SG_OP_COPY_H2D: {
-        if (a.host_ptr == 0 || !d.vram.owns_range(cmd.dst, cmd.size)) return -EFAULT;
+        if (a.host_ptr == 0 || !owns(d, cmd.dst, cmd.size)) return -EFAULT;
         const uint64_t dst = cmd.dst, total = cmd.size;
-        d.bytes_h2d += total;
+        d.bytes_h2d.fetch_add(total, std::memory_order_relaxed);
 
         if (pinned(d, a.host_ptr, total)) {
             // Direct DMA from the user's buffer. Asynchronous: the caller owns
@@ -426,80 +555,84 @@ int do_submit(Driver& d, sg_submit_args& a) {
             cmd.src0 = a.host_ptr;
             a.fence = enqueue(d, eng, chn, cmd);
             a.out_flags |= SG_SUBMIT_DIRECT;
-            d.bytes_direct += total;
+            d.bytes_direct.fetch_add(total, std::memory_order_relaxed);
             return 0;
         }
 
         // Pageable: pipeline through the staging pool. memcpy of chunk i+1
-        // proceeds while the DMA of chunk i is in flight; we only block when
-        // wrapping onto a slot whose DMA has not retired yet. The slot cursor
-        // persists across calls so that a sequence of small copies pipelines
-        // too, instead of all queuing on slot 0.
-        d.bytes_staged += total;
+        // proceeds while the DMA of chunk i is in flight; a slot is reused
+        // only once the DMA that last used it has retired.
+        d.bytes_staged.fetch_add(total, std::memory_order_relaxed);
         const auto* src = reinterpret_cast<const uint8_t*>(a.host_ptr);
         for (uint64_t off = 0; off < total; off += d.chunk) {
-            const uint32_t s = d.next_slot;
-            d.next_slot = (s + 1) % d.slots;
+            Fence prev;
+            const uint32_t s = acquire_slot(d, &prev);
             const uint64_t n = std::min<uint64_t>(d.chunk, total - off);
-            if (int rc = wait_fence(d, d.slot_fence[s], &d.staging_waits)) return rc;
-            std::memcpy(d.slot(s), src + off, n);
-            cmd.src0 = reinterpret_cast<uint64_t>(d.slot(s));
+            if (int rc = wait_fence(d, prev, &d.staging_waits)) { release_slot(d, s, prev); return rc; }
+            std::memcpy(d.slot_ptr(s), src + off, n);
+            cmd.src0 = reinterpret_cast<uint64_t>(d.slot_ptr(s));
             cmd.dst = dst + off;
             cmd.size = n;
             a.fence = enqueue(d, eng, chn, cmd);
-            d.slot_fence[s] = {eng, chn, a.fence};
+            release_slot(d, s, {eng, chn, a.fence});
         }
         return 0;
     }
 
     case SG_OP_COPY_D2H: {
-        if (a.host_ptr == 0 || !d.vram.owns_range(cmd.src0, cmd.size)) return -EFAULT;
+        if (a.host_ptr == 0 || !owns(d, cmd.src0, cmd.size)) return -EFAULT;
         const uint64_t src = cmd.src0, total = cmd.size;
-        d.bytes_d2h += total;
+        d.bytes_d2h.fetch_add(total, std::memory_order_relaxed);
 
         if (pinned(d, a.host_ptr, total)) {
             cmd.dst = a.host_ptr;
             a.fence = enqueue(d, eng, chn, cmd);
             a.out_flags |= SG_SUBMIT_DIRECT;
-            d.bytes_direct += total;
+            d.bytes_direct.fetch_add(total, std::memory_order_relaxed);
             return 0;
         }
 
-        // Pageable: keep up to `slots` DMAs ahead of the host copy-out. A
-        // slot's previous user may have been a DMA on another engine, so
-        // each issue waits on that slot's own fence before reusing it.
-        d.bytes_staged += total;
+        // Pageable: keep up to `slots` DMAs ahead of the host copy-out.
+        d.bytes_staged.fetch_add(total, std::memory_order_relaxed);
         auto* dst = reinterpret_cast<uint8_t*>(a.host_ptr);
         const uint64_t nchunks = (total + d.chunk - 1) / d.chunk;
-        const uint32_t base = d.next_slot;
-        auto slot_of = [&](uint64_t i) { return uint32_t((base + i) % d.slots); };
-        auto issue = [&](uint64_t i) -> int {
-            const uint32_t s = slot_of(i);
-            if (int rc = wait_fence(d, d.slot_fence[s], &d.staging_waits)) return rc;
-            cmd.src0 = src + i * d.chunk;
-            cmd.dst = reinterpret_cast<uint64_t>(d.slot(s));
-            cmd.size = std::min<uint64_t>(d.chunk, total - i * d.chunk);
-            d.slot_fence[s] = {eng, chn, enqueue(d, eng, chn, cmd)};
+        struct Issued { uint32_t slot; uint64_t fence; };
+        std::vector<Issued> window;
+        window.reserve(d.slots);
+        uint64_t issued = 0, done = 0;
+        auto issue = [&]() -> int {
+            Fence prev;
+            const uint32_t s = acquire_slot(d, &prev);
+            if (int rc = wait_fence(d, prev, &d.staging_waits)) { release_slot(d, s, prev); return rc; }
+            cmd.src0 = src + issued * d.chunk;
+            cmd.dst = reinterpret_cast<uint64_t>(d.slot_ptr(s));
+            cmd.size = std::min<uint64_t>(d.chunk, total - issued * d.chunk);
+            window.push_back({s, enqueue(d, eng, chn, cmd)});
+            ++issued;
             return 0;
         };
-        for (uint64_t i = 0; i < std::min<uint64_t>(d.slots, nchunks); ++i)
-            if (int rc = issue(i)) return rc;
-        for (uint64_t i = 0; i < nchunks; ++i) {
-            if (int rc = wait_fence(d, d.slot_fence[slot_of(i)])) return rc;
-            const uint64_t n = std::min<uint64_t>(d.chunk, total - i * d.chunk);
-            std::memcpy(dst + i * d.chunk, d.slot(slot_of(i)), n);
-            if (i + d.slots < nchunks)
-                if (int rc = issue(i + d.slots)) return rc;
+        // Leave headroom in the pool for other threads' copies.
+        const uint64_t depth = std::max<uint64_t>(1, d.slots / 2);
+        while (issued < std::min<uint64_t>(depth, nchunks))
+            if (int rc = issue()) return rc;
+        while (done < nchunks) {
+            Issued w = window.front();
+            window.erase(window.begin());
+            if (int rc = wait_fence(d, {eng, chn, w.fence})) { release_slot(d, w.slot, {eng, chn, w.fence}); return rc; }
+            const uint64_t n = std::min<uint64_t>(d.chunk, total - done * d.chunk);
+            std::memcpy(dst + done * d.chunk, d.slot_ptr(w.slot), n);
+            release_slot(d, w.slot, {eng, chn, w.fence});
+            ++done;
+            if (issued < nchunks)
+                if (int rc = issue()) return rc;
         }
-        d.next_slot = slot_of(nchunks);
-        a.fence = d.put[eng][chn]; // everything issued here has retired
+        a.fence = published(d, eng, chn); // everything issued here has retired
         return 0;
     }
 
     case SG_OP_VADD_F32: {
         const uint64_t bytes = uint64_t{cmd.arg0} * sizeof(float);
-        if (!d.vram.owns_range(cmd.dst, bytes) || !d.vram.owns_range(cmd.src0, bytes) ||
-            !d.vram.owns_range(cmd.src1, bytes))
+        if (!owns(d, cmd.dst, bytes) || !owns(d, cmd.src0, bytes) || !owns(d, cmd.src1, bytes))
             return -EFAULT;
         a.fence = enqueue(d, eng, chn, cmd);
         return 0;
@@ -507,9 +640,8 @@ int do_submit(Driver& d, sg_submit_args& a) {
 
     case SG_OP_GEMM_F32: {
         const uint64_t m = cmd.arg0, n = cmd.arg1, k = cmd.arg2;
-        if (!d.vram.owns_range(cmd.src0, m * k * sizeof(float)) ||
-            !d.vram.owns_range(cmd.src1, k * n * sizeof(float)) ||
-            !d.vram.owns_range(cmd.dst, m * n * sizeof(float)))
+        if (!owns(d, cmd.src0, m * k * sizeof(float)) || !owns(d, cmd.src1, k * n * sizeof(float)) ||
+            !owns(d, cmd.dst, m * n * sizeof(float)))
             return -EFAULT;
         a.fence = enqueue(d, eng, chn, cmd);
         return 0;
@@ -539,11 +671,11 @@ extern "C" int sg_drv_close(int fd) {
     std::lock_guard<std::mutex> g(g_open_lock);
     if (fd != kFd || g_refs == 0) return -EBADF;
     if (--g_refs == 0) {
+        drain(*g_drv); // drain before pulling the plug
         {
-            std::lock_guard<std::mutex> dl(g_drv->lock);
-            drain(*g_drv); // drain before pulling the plug
+            ExclusiveGuard a(*g_drv, g_drv->alloc_lock);
+            reclaim_locked(*g_drv);
         }
-        reclaim(*g_drv);
         g_drv->dev.power_off();
         g_drv.reset();
     }
@@ -560,26 +692,18 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
     }
     Driver& d = *dp;
 
-    // WAIT only reads fence registers, so it does not hold the driver lock
-    // while waiting: one thread synchronizing must not block submitters.
-    // SG_WAIT_ALL takes the lock just long enough to snapshot the PUTs.
-    if (req == SG_IOC_WAIT) {
+    switch (req) {
+    case SG_IOC_WAIT: {
         if (!arg) return -EINVAL;
         auto* w = static_cast<sg_wait_args*>(arg);
         if (w->engine == SG_WAIT_ALL) {
             PutSnapshot snap;
-            {
-                std::lock_guard<std::mutex> g(d.lock);
-                snapshot_puts(d, snap);
-            }
+            snapshot_puts(d, snap);
             return wait_snapshot(d, snap, w->flags);
         }
         if (w->engine >= d.num_engines || w->channel >= d.num_channels) return -EINVAL;
         return wait_fence(d, {w->engine, w->channel, w->fence}, nullptr, w->flags);
     }
-
-    std::lock_guard<std::mutex> g(d.lock);
-    switch (req) {
     case SG_IOC_QUERY: {
         if (!arg) return -EINVAL;
         auto* q = static_cast<sg_query_args*>(arg);
@@ -590,7 +714,7 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         q->num_engines = d.num_engines;
         q->num_channels = d.num_channels;
         q->wait_policy = d.policy;
-        q->reserved2 = 0;
+        q->submit_mode = d.submit_mode;
         q->spin_ns = d.spin_ns;
         return 0;
     }
@@ -598,12 +722,13 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         if (!arg) return -EINVAL;
         auto* a = static_cast<sg_alloc_args*>(arg);
         if (a->size == 0) return -EINVAL;
-        reclaim(d);
+        ExclusiveGuard g(d, d.alloc_lock);
+        reclaim_locked(d);
         auto addr = d.vram.alloc(a->size);
         if (!addr) {
             // Maybe everything we need is sitting in the deferred list.
             if (int rc = drain(d)) return rc;
-            reclaim(d);
+            reclaim_locked(d);
             addr = d.vram.alloc(a->size);
             if (!addr) return -ENOMEM;
         }
@@ -612,12 +737,13 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
     }
     case SG_IOC_FREE: {
         if (!arg) return -EINVAL;
-        reclaim(d);
         const uint64_t addr = static_cast<sg_free_args*>(arg)->addr;
+        ExclusiveGuard g(d, d.alloc_lock);
+        reclaim_locked(d);
         uint64_t size = 0;
         if (!d.vram.detach(addr, &size)) return -EINVAL;
         // Nothing may be handed this memory until every command issued so
-        // far, on any engine, has retired; recycle it then rather than
+        // far, on any channel, has retired; recycle it then rather than
         // draining now.
         Pending p{Pending::kVram, addr, size, {}};
         snapshot_puts(d, p.fence);
@@ -629,7 +755,11 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
         if (!arg) return -EINVAL;
         auto* p = static_cast<sg_pin_args*>(arg);
         if (p->addr == 0 || p->size == 0 || p->addr + p->size < p->addr) return -EINVAL;
-        reclaim(d);
+        {
+            ExclusiveGuard g(d, d.alloc_lock);
+            reclaim_locked(d);
+        }
+        ExclusiveGuard g(d, d.pin_lock);
         // Reject overlap with any existing pin.
         auto next = d.pins.lower_bound(p->addr);
         if (next != d.pins.end() && next->first < p->addr + p->size) return -EEXIST;
@@ -643,14 +773,18 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
     case SG_IOC_UNPIN: {
         if (!arg) return -EINVAL;
         auto* p = static_cast<sg_pin_args*>(arg);
-        auto it = d.pins.find(p->addr);
-        if (it == d.pins.end()) return -EINVAL;
-        // Stop treating the range as pinned immediately (new copies go via
-        // staging); tell the caller when every engine is done with it.
-        Pending pend{Pending::kPin, it->first, it->second, {}};
+        Pending pend{Pending::kPin, 0, 0, {}};
+        {
+            ExclusiveGuard g(d, d.pin_lock);
+            auto it = d.pins.find(p->addr);
+            if (it == d.pins.end()) return -EINVAL;
+            pend.addr = it->first;
+            pend.size = it->second;
+            d.pins.erase(it); // new copies from this range go via staging from now on
+        }
         snapshot_puts(d, pend.fence);
+        ExclusiveGuard g(d, d.alloc_lock);
         d.pending.push_back(pend);
-        d.pins.erase(it);
         return 0;
     }
     case SG_IOC_SUBMIT:
@@ -670,27 +804,27 @@ extern "C" int sg_drv_ioctl(int fd, unsigned int req, void* arg) {
             s->batches[e] = st.batches.load(std::memory_order_relaxed);
             s->irqs[e] = st.irqs.load(std::memory_order_relaxed);
         }
-        s->submits = d.submits;
-        s->waits = d.waits.load(std::memory_order_relaxed);
-        s->waits_spun = d.waits_spun.load(std::memory_order_relaxed);
-        s->waits_blocked = d.waits_blocked.load(std::memory_order_relaxed);
-        s->wake_latency_ns = d.wake_latency_ns.load(std::memory_order_relaxed);
-        s->stalls = d.stalls;
-        s->staging_waits = d.staging_waits;
-        s->bytes_h2d = d.bytes_h2d;
-        s->bytes_d2h = d.bytes_d2h;
-        s->bytes_direct = d.bytes_direct;
-        s->bytes_staged = d.bytes_staged;
+        auto ld = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
+        s->submits = ld(d.submits);
+        s->waits = ld(d.waits);
+        s->waits_spun = ld(d.waits_spun);
+        s->waits_blocked = ld(d.waits_blocked);
+        s->wake_latency_ns = ld(d.wake_latency_ns);
+        s->lock_wait_ns = ld(d.lock_wait_ns);
+        s->stalls = ld(d.stalls);
+        s->staging_waits = ld(d.staging_waits);
+        s->bytes_h2d = ld(d.bytes_h2d);
+        s->bytes_d2h = ld(d.bytes_d2h);
+        s->bytes_direct = ld(d.bytes_direct);
+        s->bytes_staged = ld(d.bytes_staged);
         return 0;
     }
     case SG_IOC_RESET_STATS:
         d.dev.reset_stats();
-        d.submits = d.stalls = d.staging_waits = 0;
-        d.waits.store(0, std::memory_order_relaxed);
-        d.waits_spun.store(0, std::memory_order_relaxed);
-        d.waits_blocked.store(0, std::memory_order_relaxed);
-        d.wake_latency_ns.store(0, std::memory_order_relaxed);
-        d.bytes_h2d = d.bytes_d2h = d.bytes_direct = d.bytes_staged = 0;
+        for (auto* c : {&d.submits, &d.waits, &d.waits_spun, &d.waits_blocked, &d.wake_latency_ns,
+                        &d.lock_wait_ns, &d.stalls, &d.staging_waits, &d.bytes_h2d, &d.bytes_d2h,
+                        &d.bytes_direct, &d.bytes_staged})
+            c->store(0, std::memory_order_relaxed);
         return 0;
     default:
         return -ENOTTY;

@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define SG_ABI_VERSION   5u
+#define SG_ABI_VERSION   6u
 #define SG_VRAM_SIZE     (256ull << 20) /* 256 MiB of modeled device memory      */
 #define SG_STAGING_SLOTS 8u             /* default pageable-copy staging pool ...    */
 #define SG_STAGING_CHUNK (256ull << 10) /* ... 8 x 256 KiB, from the sweep in ADR 002 */
@@ -52,6 +52,13 @@ extern "C" {
 #define SG_WAIT_BLOCK     2u            /* sg_wait_args.flags: sleep without spinning */
 
 enum sg_wait_policy { SG_POLICY_SPIN = 0, SG_POLICY_BLOCK = 1, SG_POLICY_HYBRID = 2, SG_POLICY_ADAPTIVE = 3 };
+
+/*
+ * How concurrent submitters to one channel are serialized (SG_SUBMIT_MODE
+ * env): a per-channel mutex, or a lock-free ticket reservation where each
+ * producer claims a slot with fetch_add and publishes in ticket order.
+ */
+enum sg_submit_mode { SG_SUBMIT_MUTEX = 0, SG_SUBMIT_TICKET = 1 };
 
 enum sg_opcode {
     SG_OP_NOP        = 0,
@@ -92,7 +99,7 @@ struct sg_query_args {
     uint32_t num_engines;  /* 1 compute + copy engines */
     uint32_t num_channels; /* rings per engine         */
     uint32_t wait_policy;  /* enum sg_wait_policy in effect */
-    uint32_t reserved2;
+    uint32_t submit_mode;  /* enum sg_submit_mode in effect */
     uint64_t spin_ns;      /* spin budget before blocking (hybrid; cap for adaptive) */
 };
 
@@ -156,6 +163,7 @@ struct sg_stats_args {
     uint64_t waits_spun;    /* ... of which satisfied while spinning            */
     uint64_t waits_blocked; /* ... of which went to sleep                       */
     uint64_t wake_latency_ns; /* sum over blocked waits: retire -> waiter awake */
+    uint64_t lock_wait_ns;  /* driver: time spent contended on any driver lock  */
     uint64_t stalls;        /* driver: times submission blocked on a full ring  */
     uint64_t staging_waits; /* driver: times the host blocked for a staging slot */
     uint64_t bytes_h2d;

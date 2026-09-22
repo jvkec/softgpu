@@ -114,6 +114,7 @@ struct Window {
     double waits() const { return double(s1.driver_waits - s0.driver_waits); }
     double waits_blocked() const { return double(s1.waits_blocked - s0.waits_blocked); }
     double wake_ns() const { return double(s1.wake_latency_ns - s0.wake_latency_ns); }
+    double lock_ns() const { return double(s1.lock_wait_ns - s0.lock_wait_ns); }
     double stalls() const { return double(s1.driver_stalls - s0.driver_stalls); }
     double staging_waits() const { return double(s1.staging_waits - s0.staging_waits); }
     double bytes_direct() const { return double(s1.bytes_direct - s0.bytes_direct); }
@@ -124,6 +125,7 @@ struct Window {
         r.metrics["wall_ms"] = wall_ns() / 1e6;
         r.metrics["cpu_ns_per_op"] = cpu_ns() / ops;
         r.metrics["cpu_frac"] = cpu_ns() / std::max(1.0, wall_ns()); // submitter CPU / wall
+        r.metrics["lock_ns_per_op"] = lock_ns() / ops; // contended driver-lock time
         if (waits() > 0) r.metrics["blocked_frac"] = waits_blocked() / waits();
         if (waits_blocked() > 0) r.metrics["wake_us"] = wake_ns() / waits_blocked() / 1e3;
         r.metrics["dev_util"] = util(0); // compute engine
